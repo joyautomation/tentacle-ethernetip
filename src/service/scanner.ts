@@ -286,6 +286,17 @@ export async function createScanner(
           continue;
         }
 
+        // Skip variables that haven't been successfully read yet
+        // This ensures the initial query matches what the subscription shows
+        if (cached.quality !== "good" || cached.value === null) {
+          continue;
+        }
+
+        // Skip variables with invalid names (non-printable ASCII, weird unicode)
+        if (!/^[\x20-\x7E]+$/.test(cached.name)) {
+          continue;
+        }
+
         allVariables.push({
           variableId: cached.name,
           value: cached.value,
