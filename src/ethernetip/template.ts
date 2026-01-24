@@ -276,23 +276,29 @@ async function readTemplateDefinition(
 ): Promise<Uint8Array | null> {
   // Calculate needed size: 8 bytes per member definition + ~32 bytes per name + 200 overhead
   // Rockwell AOIs/UDTs can have long member names (up to 40 chars), so we estimate generously
-  // Note: word count in request is interpreted as byte count by the PLC
   const estimatedBytes = memberCount * 8 + memberCount * 32 + 200;
 
-  // We may need multiple reads for large templates
-  const maxBytesPerRead = 480;  // Safe limit for unconnected messaging
+  // Template read uses 32-bit word addressing:
+  // - wordOffset is in 32-bit words (4 bytes each)
+  // - wordsToRead specifies how many 32-bit words to read
+  // - PLC returns (wordsToRead * 4) bytes of data
+  const maxWordsPerRead = 120;  // 120 words = 480 bytes, safe limit for unconnected messaging
   const allData: Uint8Array[] = [];
-  let offset = 0;
+  let byteOffset = 0;
 
-  while (offset < estimatedBytes) {
-    const bytesToRead = Math.min(maxBytesPerRead, estimatedBytes - offset);
-    const request = buildReadTemplateRequest(cip, templateId, offset, bytesToRead);
+  while (byteOffset < estimatedBytes) {
+    // Convert byte offset to word offset (must be aligned to 4-byte boundary)
+    const wordOffset = Math.floor(byteOffset / 4);
+    const bytesRemaining = estimatedBytes - byteOffset;
+    const wordsToRead = Math.min(maxWordsPerRead, Math.ceil(bytesRemaining / 4));
+
+    const request = buildReadTemplateRequest(cip, templateId, wordOffset, wordsToRead);
     const response = await sendRaw(cip, request);
 
     const status = response[42];
     // Status 0x00 = success, 0x06 = partial (more data available)
     if (status !== 0x00 && status !== 0x06) {
-      if (offset === 0) {
+      if (byteOffset === 0) {
         log.eip.warn(`Template ${templateId} definition read failed: status=0x${status.toString(16)}`);
         return null;
       }
@@ -309,10 +315,11 @@ async function readTemplateDefinition(
     }
 
     allData.push(chunk);
-    offset += chunk.length;
+    byteOffset += chunk.length;
 
     // If we got less than requested, we're done
-    if (chunk.length < bytesToRead) {
+    const expectedBytes = wordsToRead * 4;
+    if (chunk.length < expectedBytes) {
       break;
     }
   }
