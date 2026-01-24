@@ -109,6 +109,22 @@ export async function createScanner(
     return variableId.replace(/\./g, "_");
   }
 
+  /**
+   * Validate tag name - must be printable ASCII, no weird unicode or garbage
+   * Valid Rockwell tag names: letters, numbers, underscores, and dots (for UDT paths)
+   */
+  function isValidTagName(name: string): boolean {
+    // Must be non-empty
+    if (!name || name.length === 0) return false;
+    // Must be printable ASCII only (0x20-0x7E), allowing dots for UDT paths
+    if (!/^[\x20-\x7E]+$/.test(name)) return false;
+    // Must start with a letter or underscore (standard identifier rules)
+    if (!/^[A-Za-z_]/.test(name)) return false;
+    // Reject fallback member names
+    if (/_member\d+$/.test(name)) return false;
+    return true;
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Tag Cache (NATS KV)
   // ─────────────────────────────────────────────────────────────────────────
@@ -367,7 +383,11 @@ export async function createScanner(
         // Build set of discovered tag names with datatypes
         const discoveredTags = new Map<string, string>(); // name -> datatype
         for (const t of atomicTags) {
-          discoveredTags.set(t.name, t.datatype);
+          if (isValidTagName(t.name)) {
+            discoveredTags.set(t.name, t.datatype);
+          } else {
+            log.eip.debug(`Skipping invalid atomic tag name: "${t.name}"`);
+          }
         }
 
         // Expand struct tags synchronously (must complete before polling starts)
@@ -388,10 +408,10 @@ export async function createScanner(
               const members = await expandUdtMembers(conn.cip!, structTag.name, templateId);
 
               // Add expanded members (already filtered to atomic types)
-              // Skip any with fallback names (_memberX) as these indicate failed template parsing
+              // Validate each member path before adding
               for (const member of members) {
-                if (/_member\d+$/.test(member.path)) {
-                  log.eip.debug(`Skipping fallback member path: ${member.path}`);
+                if (!isValidTagName(member.path)) {
+                  log.eip.debug(`Skipping invalid UDT member path: "${member.path}"`);
                   continue;
                 }
                 discoveredTags.set(member.path, member.datatype);
