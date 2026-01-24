@@ -21,6 +21,7 @@
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 import { createConfigManager } from "./src/service/config.ts";
+import { createMqttConfigManager } from "./src/service/mqttConfig.ts";
 import { createScanner } from "./src/service/scanner.ts";
 
 const log = createLogger("ethernetip", LogLevel.info);
@@ -92,9 +93,13 @@ async function main(): Promise<void> {
   log.info("Loading configuration from NATS KV...");
   const configManager = await createConfigManager(nc, projectId);
 
+  // Create MQTT config manager (controls which variables go to MQTT)
+  log.info("Loading MQTT configuration...");
+  const mqttConfigManager = await createMqttConfigManager(nc, projectId);
+
   // Create scanner
   log.info("Initializing scanner...");
-  const scanner = await createScanner(nc, projectId, configManager);
+  const scanner = await createScanner(nc, projectId, configManager, mqttConfigManager);
 
   // Start scanning
   scanner.start();
@@ -106,6 +111,9 @@ async function main(): Promise<void> {
   log.info(`  nats kv put field-config-${projectId} plc.myplc '{"host":"192.168.1.100","port":44818,"scanRate":1000,"enabled":true}'`);
   log.info(`  nats kv put field-config-${projectId} plc.myplc.tags '["Tag1","Tag2"]'`);
   log.info("");
+  log.info("To enable MQTT for variables:");
+  log.info(`  nats kv put mqtt-config-${projectId} mqtt.variables '{"TagName":{"enabled":true}}'`);
+  log.info("");
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
@@ -114,8 +122,9 @@ async function main(): Promise<void> {
     // Stop scanner
     await scanner.stop();
 
-    // Stop config manager
+    // Stop config managers
     configManager.stop();
+    mqttConfigManager.stop();
 
     // Drain NATS connection
     await nc.drain();

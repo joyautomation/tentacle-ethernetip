@@ -4,32 +4,58 @@
  * Each enabled PLC gets its own polling loop that:
  * 1. Connects to the PLC
  * 2. Reads configured tags (or browses all if no tags specified)
- * 3. Publishes values to NATS
+ * 3. Publishes values to NATS (pub/sub, no KV storage)
  * 4. Repeats at the configured scan rate
+ *
+ * Also handles NATS request/reply for:
+ * - plc.variables.{projectId} - returns current poll list with latest values
  */
 
-import { type NatsConnection } from "@nats-io/transport-deno";
-import { jetstream, StorageType, DiscardPolicy } from "@nats-io/jetstream";
+import { type NatsConnection, type Subscription } from "@nats-io/transport-deno";
 import {
   createCip,
   destroyCip,
   readTag,
   browseTags,
+  expandUdtMembers,
+  getTemplateId,
   type Cip,
-  type TagInfo,
 } from "../ethernetip/mod.ts";
 import { decodeFloat32, decodeUint } from "../ethernetip/encode.ts";
 import { log } from "../utils/logger.ts";
 import type { PlcConfig, ConfigManager, ConfigChangeEvent } from "./config.ts";
+import type { MqttConfigManager } from "./mqttConfig.ts";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Simplified tag info for polling (subset of DiscoveredTag)
+ */
+type PollTag = {
+  name: string;
+  datatype: string;
+};
+
+/**
+ * Variable with current value (for request/reply)
+ */
+type VariableInfo = {
+  variableId: string;
+  value: number | boolean | string | null;
+  datatype: string;
+  quality: "good" | "bad" | "unknown";
+  source: string;
+  lastUpdated: number;
+};
+
 type PlcConnection = {
   config: PlcConfig;
   cip: Cip | null;
-  tags: TagInfo[];
+  tags: PollTag[];
+  /** Current values for each tag (keyed by variableId) */
+  values: Map<string, VariableInfo>;
   polling: boolean;
   abortController: AbortController;
 };
@@ -57,35 +83,25 @@ export async function createScanner(
   nc: NatsConnection,
   projectId: string,
   configManager: ConfigManager,
+  mqttConfigManager?: MqttConfigManager,
 ): Promise<ScannerManager> {
   const connections = new Map<string, PlcConnection>();
+  let requestSub: Subscription | null = null;
 
-  // Setup variables KV bucket
-  const variablesBucket = `plc-variables-${projectId}`;
-  // NATS KV stream naming: stream is "KV_<bucket>", subjects are "$KV.<bucket>.>"
-  const streamName = `KV_${variablesBucket}`;
-  const subjectPrefix = `$KV.${variablesBucket}`;
+  // NATS subjects for real-time data (pub/sub)
+  const dataSubject = `plc.data.${projectId}`;
+  const mqttDataSubjectBase = `plc.data.${projectId}`;
 
-  const js = jetstream(nc);
-  const jsm = await js.jetstreamManager();
+  // NATS subject for request/reply (get current variables)
+  const variablesSubject = `plc.variables.${projectId}`;
 
-  try {
-    await jsm.streams.info(streamName);
-  } catch {
-    await jsm.streams.add({
-      name: streamName,
-      subjects: [`${subjectPrefix}.>`],
-      storage: StorageType.File,
-      discard: DiscardPolicy.New,
-      max_msgs_per_subject: 1,
-      max_age: 0,
-      allow_rollup_hdrs: true, // Required for KV delete operations
-    });
-    log.eip.info(`Created variables bucket: ${variablesBucket}`);
+  /**
+   * Sanitize variableId for use in NATS subject
+   * Replaces dots with underscores so NATS doesn't treat them as level separators
+   */
+  function sanitizeForSubject(variableId: string): string {
+    return variableId.replace(/\./g, "_");
   }
-
-  // NATS topic for real-time data
-  const dataTopic = `plc.data.${projectId}`;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Value decoding
@@ -135,33 +151,81 @@ export async function createScanner(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Publishing
+  // Publishing (pub/sub only, no KV)
   // ─────────────────────────────────────────────────────────────────────────
 
   function publishValue(
+    conn: PlcConnection,
     variableId: string,
     value: number | boolean | string,
     datatype: string,
     quality: "good" | "bad" = "good",
   ): void {
+    const now = Date.now();
+    const natsDatatype = getNatsDatatype(datatype);
+
+    // Store in connection's value cache
+    conn.values.set(variableId, {
+      variableId,
+      value,
+      datatype: natsDatatype,
+      quality,
+      source: "plc",
+      lastUpdated: now,
+    });
+
+    // Build message matching PlcDataMessage schema from nats-schema
     const message = {
       projectId,
       variableId,
       value,
-      lastUpdated: Date.now(),
-      datatype: getNatsDatatype(datatype),
-      source: "plc",
-      quality,
+      timestamp: now,
+      datatype: natsDatatype,
     };
 
-    const payload = JSON.stringify(message);
-    const payloadBytes = new TextEncoder().encode(payload);
+    const payload = new TextEncoder().encode(JSON.stringify(message));
 
-    // Publish to topic (real-time)
-    nc.publish(`${dataTopic}.${variableId}`, payloadBytes);
+    // Publish to flat subject (internal use, tentacle-graphql)
+    nc.publish(dataSubject, payload);
 
-    // Store in KV (persistence)
-    nc.publish(`${subjectPrefix}.${variableId}`, payloadBytes);
+    // Only publish to MQTT subject if variable is explicitly enabled
+    if (mqttConfigManager?.isEnabled(variableId)) {
+      const mqttSubject = `${mqttDataSubjectBase}.${sanitizeForSubject(variableId)}`;
+      nc.publish(mqttSubject, payload);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Request/Reply Handler
+  // ─────────────────────────────────────────────────────────────────────────
+
+  function getAllVariables(): VariableInfo[] {
+    const allVariables: VariableInfo[] = [];
+
+    for (const conn of connections.values()) {
+      for (const variable of conn.values.values()) {
+        allVariables.push(variable);
+      }
+    }
+
+    return allVariables;
+  }
+
+  async function startRequestHandler(): Promise<void> {
+    requestSub = nc.subscribe(variablesSubject);
+    log.eip.info(`Listening for variable requests on ${variablesSubject}`);
+
+    for await (const msg of requestSub) {
+      try {
+        const variables = getAllVariables();
+        log.eip.info(`Variables request received, returning ${variables.length} variables`);
+        const response = JSON.stringify(variables);
+        msg.respond(new TextEncoder().encode(response));
+      } catch (err) {
+        log.eip.error(`Error handling variables request: ${err}`);
+        msg.respond(new TextEncoder().encode("[]"));
+      }
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -189,20 +253,56 @@ export async function createScanner(
       if (conn.config.tags.length === 0) {
         log.eip.info(`Browsing tags for PLC ${plcId}...`);
         const allTags = await browseTags(conn.cip);
-        // Filter to atomic types only
-        conn.tags = allTags.filter(
+
+        // Separate atomic and struct tags
+        const atomicTags = allTags.filter(
           (t) => ATOMIC_TYPES.includes(t.datatype) && !t.isArray,
         );
-        log.eip.info(`Found ${conn.tags.length} atomic tags on PLC ${plcId}`);
+        const structTags = allTags.filter(
+          (t) => t.isStruct && !t.isArray,
+        );
+
+        log.eip.info(`Found ${atomicTags.length} atomic tags, ${structTags.length} struct tags`);
+
+        // Start with atomic tags
+        conn.tags = atomicTags.map((t) => ({ name: t.name, datatype: t.datatype }));
+
+        // Expand struct tags synchronously (must complete before polling starts)
+        if (structTags.length > 0) {
+          log.eip.info(`Expanding ${structTags.length} struct tags...`);
+          let expandedCount = 0;
+
+          for (const structTag of structTags) {
+            try {
+              // Get template ID from symbolType
+              const templateId = getTemplateId(structTag.symbolType);
+              if (templateId === null) {
+                log.eip.debug(`No template ID for ${structTag.name}, skipping`);
+                continue;
+              }
+
+              // Expand UDT members
+              const members = await expandUdtMembers(conn.cip!, structTag.name, templateId);
+
+              // Add expanded members to poll list (already filtered to atomic types)
+              for (const member of members) {
+                conn.tags.push({ name: member.path, datatype: member.datatype });
+                expandedCount++;
+              }
+            } catch (err) {
+              log.eip.debug(`Failed to expand ${structTag.name}: ${err}`);
+            }
+          }
+
+          log.eip.info(`UDT expansion complete: added ${expandedCount} members, total ${conn.tags.length} tags`);
+        }
+
+        log.eip.info(`Ready to poll ${conn.tags.length} tags for PLC ${plcId}`);
       } else {
         // Use configured tags
         conn.tags = conn.config.tags.map((name) => ({
           name,
           datatype: "UNKNOWN",
-          dimensions: [],
-          isStruct: false,
-          isArray: false,
-          instanceId: 0,
         }));
         log.eip.info(`Using ${conn.tags.length} configured tags for PLC ${plcId}`);
       }
@@ -227,6 +327,9 @@ export async function createScanner(
       }
       conn.cip = null;
     }
+
+    // Clear cached values
+    conn.values.clear();
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -253,45 +356,49 @@ export async function createScanner(
         }
       }
 
-      // Read all tags
+      // Read all tags (take snapshot to handle background UDT expansion)
+      const tagsToRead = [...conn.tags];
+      log.eip.info(`Poll cycle: ${tagsToRead.length} tags to read (conn.tags has ${conn.tags.length})`);
       let readCount = 0;
-      for (const tag of conn.tags) {
+      let failCount = 0;
+      for (const tag of tagsToRead) {
         if (conn.abortController.signal.aborted) break;
 
         try {
           const response = await readTag(conn.cip!, tag.name);
           if (response.success) {
             const { value } = decodeTagValue(response.data, tag.datatype);
-            // Use underscore for UDT member access in variable IDs
-            const variableId = tag.name.replace(/\./g, "_");
-            publishValue(variableId, value, tag.datatype, "good");
+            // Use original tag name as variableId (preserves UDT path like "MyUDT.Member.Value")
+            publishValue(conn, tag.name, value, tag.datatype, "good");
             readCount++;
           } else {
-            log.eip.debug(`Failed to read ${tag.name}: status 0x${response.status.toString(16)}`);
+            failCount++;
+            if (failCount <= 5) {
+              log.eip.info(`Read failed for "${tag.name}": status 0x${response.status.toString(16)}`);
+            }
           }
         } catch (err) {
-          log.eip.warn(`Error reading ${tag.name}: ${err}`);
-          // Connection might be broken
-          await disconnectPlc(plcId);
-          break;
+          failCount++;
+          if (failCount <= 5) {
+            log.eip.info(`Error reading "${tag.name}": ${err}`);
+          }
         }
       }
 
-      if (readCount > 0) {
-        log.eip.debug(`PLC ${plcId}: read ${readCount}/${conn.tags.length} tags`);
+      if (readCount > 0 || failCount > 0) {
+        log.eip.info(`Polling ${plcId}: ${readCount} success, ${failCount} failed, ${conn.values.size} cached`);
       }
 
-      // Calculate time to wait
+      // Wait for next scan
       const elapsed = Date.now() - startTime;
-      const waitTime = Math.max(0, conn.config.scanRate - elapsed);
-
-      if (waitTime > 0) {
-        await sleep(waitTime, conn.abortController.signal);
+      const delay = Math.max(0, conn.config.scanRate - elapsed);
+      if (delay > 0) {
+        await sleep(delay, conn.abortController.signal);
       }
     }
 
     conn.polling = false;
-    log.eip.info(`Stopped polling loop for PLC ${plcId}`);
+    log.eip.info(`Stopped polling for PLC ${plcId}`);
   }
 
   async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -309,44 +416,44 @@ export async function createScanner(
   // ─────────────────────────────────────────────────────────────────────────
 
   function handleConfigChange(event: ConfigChangeEvent): void {
-    const { type, plcId, config } = event;
+    const plcId = event.plcId;
 
-    if (type === "plc-added" && config) {
-      // New PLC added
-      const conn: PlcConnection = {
-        config,
-        cip: null,
-        tags: [],
-        polling: false,
-        abortController: new AbortController(),
-      };
-      connections.set(plcId, conn);
+    if (event.type === "plc-added" || event.type === "plc-updated") {
+      const config = configManager.getPlc(plcId);
+      if (!config) return;
 
-      if (config.enabled) {
-        pollPlc(plcId); // Start polling (async, non-blocking)
-      }
-    } else if (type === "plc-updated" && config) {
-      // PLC config updated
-      const conn = connections.get(plcId);
-      if (conn) {
-        const wasEnabled = conn.config.enabled;
-        conn.config = config;
+      const existing = connections.get(plcId);
+      if (existing) {
+        // Update config and restart if needed
+        const wasEnabled = existing.config.enabled;
+        existing.config = config;
 
-        // Handle enable/disable
         if (!wasEnabled && config.enabled) {
           // Start polling
-          conn.abortController = new AbortController();
           pollPlc(plcId);
         } else if (wasEnabled && !config.enabled) {
           // Stop polling
-          conn.abortController.abort();
+          existing.abortController.abort();
+          existing.abortController = new AbortController();
+          disconnectPlc(plcId);
         }
-      } else if (config.enabled) {
-        // Treat as new
-        handleConfigChange({ type: "plc-added", plcId, config });
+      } else {
+        // New PLC
+        const conn: PlcConnection = {
+          config,
+          cip: null,
+          tags: [],
+          values: new Map(),
+          polling: false,
+          abortController: new AbortController(),
+        };
+        connections.set(plcId, conn);
+
+        if (config.enabled) {
+          pollPlc(plcId);
+        }
       }
-    } else if (type === "plc-removed") {
-      // PLC removed
+    } else if (event.type === "plc-removed") {
       const conn = connections.get(plcId);
       if (conn) {
         conn.abortController.abort();
@@ -362,15 +469,21 @@ export async function createScanner(
 
   const manager: ScannerManager = {
     start() {
+      log.eip.info("Starting scanner...");
+
       // Subscribe to config changes
       configManager.onChange(handleConfigChange);
 
-      // Start polling for all enabled PLCs
+      // Start request handler (non-blocking)
+      startRequestHandler();
+
+      // Initialize connections for existing PLCs
       for (const [plcId, plcConfig] of configManager.config.plcs) {
         const conn: PlcConnection = {
           config: plcConfig,
           cip: null,
           tags: [],
+          values: new Map(),
           polling: false,
           abortController: new AbortController(),
         };
@@ -381,18 +494,26 @@ export async function createScanner(
         }
       }
 
-      if (connections.size === 0) {
-        log.eip.info("No PLCs configured. Waiting for configuration via NATS KV...");
-      }
+      log.eip.info(`Scanner started with ${connections.size} PLCs configured`);
     },
 
     async stop() {
+      log.eip.info("Stopping scanner...");
+
+      // Stop request handler
+      if (requestSub) {
+        requestSub.unsubscribe();
+        requestSub = null;
+      }
+
       // Stop all polling loops
       for (const [plcId, conn] of connections) {
         conn.abortController.abort();
         await disconnectPlc(plcId);
       }
+
       connections.clear();
+      log.eip.info("Scanner stopped");
     },
   };
 

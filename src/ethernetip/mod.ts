@@ -82,3 +82,14 @@ export {
   listPrograms,
 } from "./discovery.ts";
 export type { DiscoveredTag } from "./discovery.ts";
+
+// UDT Template reading
+export {
+  readTemplate,
+  expandUdtMembers,
+  getTemplateId,
+  clearTemplateCache,
+  getTemplateCacheSize,
+  ATOMIC_TYPES,
+} from "./template.ts";
+export type { Template, TemplateMember } from "./template.ts";

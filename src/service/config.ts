@@ -223,14 +223,19 @@ export async function createConfigManager(
         // Handle plc.{id}.tags changes
         if (parts.length === 3 && parts[0] === "plc" && parts[2] === "tags") {
           const plcId = parts[1];
-          const plcConfig = config.plcs.get(plcId);
+          const oldConfig = config.plcs.get(plcId);
 
-          if (plcConfig && msg.data && msg.data.length > 0) {
+          if (oldConfig && msg.data && msg.data.length > 0) {
             try {
               const tags = JSON.parse(new TextDecoder().decode(msg.data));
-              plcConfig.tags = Array.isArray(tags) ? tags : [];
-              notifyChange({ type: "plc-updated", plcId, config: plcConfig });
-              log.eip.info(`PLC ${plcId} tags updated: ${plcConfig.tags.length} tags`);
+              // Create a new config object (don't mutate!) so scanner can detect the change
+              const newConfig: PlcConfig = {
+                ...oldConfig,
+                tags: Array.isArray(tags) ? tags : [],
+              };
+              config.plcs.set(plcId, newConfig);
+              notifyChange({ type: "plc-updated", plcId, config: newConfig });
+              log.eip.info(`PLC ${plcId} tags updated: ${newConfig.tags.length} tags`);
             } catch (err) {
               log.eip.warn(`Failed to parse tags for ${plcId}: ${err}`);
             }

@@ -40,6 +40,11 @@ export type LogicalSegment = {
 
 /**
  * Encode a logical segment to bytes
+ *
+ * CIP logical segment format:
+ * - 8-bit: [header, value] (2 bytes)
+ * - 16-bit: [header, 0x00, value_lo, value_hi] (4 bytes) - pad AFTER header
+ * - 32-bit: [header, 0x00, value bytes...] (6 bytes) - pad AFTER header
  */
 export function encodeLogicalSegment(
   segment: LogicalSegment,
@@ -59,6 +64,17 @@ export function encodeLogicalSegment(
   const header = new Uint8Array([segmentType | logicalType | format]);
   const valueBytes = encodeUint(value, size as 1 | 2 | 4);
 
+  // For 16-bit and 32-bit values, CIP requires a pad byte AFTER the header
+  if (size > 1) {
+    const result = joinBytes([header, new Uint8Array([0x00]), valueBytes]);
+    // Add trailing pad if needed for word alignment
+    if (padded && result.length % 2 !== 0) {
+      return joinBytes([result, new Uint8Array([0x00])]);
+    }
+    return result;
+  }
+
+  // 8-bit: no internal padding needed
   if (padded && (header.length + valueBytes.length) % 2 !== 0) {
     return joinBytes([header, valueBytes, new Uint8Array([0x00])]);
   }
