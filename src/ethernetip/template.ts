@@ -628,6 +628,11 @@ export async function readTemplate(
       size = info.size;
     }
 
+    // Log suspicious members: short uppercase names that are atomic but might be structs
+    if (!isStruct && datatype !== "UNKNOWN" && name.length <= 4 && name === name.toUpperCase() && /^[A-Z]+$/.test(name)) {
+      log.eip.debug(`Template ${templateId}: suspicious atomic member "${name}" (typeCode=0x${def.typeCode.toString(16)}, datatype=${datatype})`);
+    }
+
     members.push({
       name,
       typeCode,
@@ -715,6 +720,9 @@ export async function expandUdtMembers(
       // Add atomic member
       log.eip.debug(`  Adding atomic member: ${memberPath} (${member.datatype})`);
       results.push({ path: memberPath, datatype: member.datatype });
+    } else if (member.isStruct && !member.templateId) {
+      // Struct without template ID - can't expand, skip it
+      log.eip.warn(`  Struct member ${member.name} has no templateId (typeCode=0x${member.typeCode.toString(16)}), skipping`);
     } else {
       log.eip.debug(`  Skipping non-atomic member: ${member.name} (${member.datatype})`);
     }
