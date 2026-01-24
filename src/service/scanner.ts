@@ -151,13 +151,16 @@ export async function createScanner(
 
   /**
    * Save variables (with values) to NATS KV cache
+   * Filters out variables with fallback names (_memberX) since they're not valid
    */
   async function saveVariableCache(plcId: string, variables: Map<string, CachedVariable>): Promise<void> {
     const subject = `${cacheSubjectPrefix}.cache.variables.${plcId}`;
-    const payload = new TextEncoder().encode(JSON.stringify([...variables.values()]));
+    // Filter out fallback names before saving
+    const validVariables = [...variables.values()].filter(v => !/_member\d+$/.test(v.name));
+    const payload = new TextEncoder().encode(JSON.stringify(validVariables));
     nc.publish(subject, payload);
     await nc.flush(); // Ensure it's persisted before continuing
-    log.eip.info(`Saved ${variables.size} variables to cache for PLC ${plcId}`);
+    log.eip.info(`Saved ${validVariables.size} variables to cache for PLC ${plcId} (filtered ${variables.size - validVariables.size} invalid)`);
   }
 
   /**
@@ -277,6 +280,12 @@ export async function createScanner(
 
     for (const conn of connections.values()) {
       for (const cached of conn.variables.values()) {
+        // Skip variables with fallback names (_memberX) - these are from templates
+        // that failed to parse correctly and won't be readable anyway
+        if (/_member\d+$/.test(cached.name)) {
+          continue;
+        }
+
         allVariables.push({
           variableId: cached.name,
           value: cached.value,
@@ -368,7 +377,12 @@ export async function createScanner(
               const members = await expandUdtMembers(conn.cip!, structTag.name, templateId);
 
               // Add expanded members (already filtered to atomic types)
+              // Skip any with fallback names (_memberX) as these indicate failed template parsing
               for (const member of members) {
+                if (/_member\d+$/.test(member.path)) {
+                  log.eip.debug(`Skipping fallback member path: ${member.path}`);
+                  continue;
+                }
                 discoveredTags.set(member.path, member.datatype);
                 expandedCount++;
               }

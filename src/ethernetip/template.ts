@@ -237,14 +237,8 @@ async function readTemplateAttributes(
   //     - Status (2 bytes) - 0 = success
   //     - Attribute value (if status is 0)
 
-  // Dump raw attribute response data (temporarily using info level for diagnostics)
-  const attrDataPreview = Array.from(response.subarray(offset, Math.min(offset + 40, response.length)))
-    .map(b => b.toString(16).padStart(2, '0')).join(' ');
-  log.eip.info(`Template ${templateId} attr raw at offset ${offset}: ${attrDataPreview}`);
-
   const attrCount = decodeUint(response.subarray(offset, offset + 2));
   offset += 2;
-  log.eip.info(`  attrCount=${attrCount}`);
 
   for (let i = 0; i < attrCount; i++) {
     const attrId = decodeUint(response.subarray(offset, offset + 2));
@@ -252,32 +246,23 @@ async function readTemplateAttributes(
     const attrStatus = decodeUint(response.subarray(offset, offset + 2));
     offset += 2;
 
-    log.eip.info(`  attr[${i}]: id=${attrId}, status=${attrStatus}`);
-
     if (attrStatus === 0) {
       if (attrId === 1) {
         // Object Definition Size (UDINT, 4 bytes) - size of template data in bytes
-        const bytes = response.subarray(offset, offset + 4);
-        structureHandle = decodeUint(bytes);
-        log.eip.info(`    attr1 bytes=[${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}] = ${structureHandle}`);
+        structureHandle = decodeUint(response.subarray(offset, offset + 4));
         offset += 4;
       } else if (attrId === 2) {
-        // Structure Handle (UDINT, 4 bytes)
-        const bytes = response.subarray(offset, offset + 4);
-        const value = decodeUint(bytes);
-        log.eip.info(`    attr2 bytes=[${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}] = ${value} (skipped)`);
+        // Structure Handle (UDINT, 4 bytes) - skip
         offset += 4;
       } else if (attrId === 3) {
         // Template Member Count (UINT, 2 bytes) - per CIP spec, this is authoritative
-        const bytes = response.subarray(offset, offset + 2);
-        memberCount = decodeUint(bytes);
-        log.eip.info(`    attr3 bytes=[${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}] = ${memberCount}`);
+        memberCount = decodeUint(response.subarray(offset, offset + 2));
         offset += 2;
       }
     }
   }
 
-  log.eip.info(`Template ${templateId} attributes: definitionSize=${structureHandle} bytes, memberCount=${memberCount}`);
+  log.eip.debug(`Template ${templateId} attributes: definitionSize=${structureHandle}, memberCount=${memberCount}`);
   return { structureHandle, memberCount };
 }
 
@@ -296,9 +281,11 @@ async function readTemplateDefinition(
   templateId: number,
   memberCount: number,
 ): Promise<Uint8Array | null> {
-  // Calculate needed size: 8 bytes per member definition + ~32 bytes per name + 200 overhead
-  // Rockwell AOIs/UDTs can have long member names (up to 40 chars), so we estimate generously
-  const estimatedBytes = memberCount * 8 + memberCount * 32 + 200;
+  // Calculate needed size: 8 bytes per member definition + ~40 bytes per name + overhead
+  // IMPORTANT: memberCount doesn't include hidden members (ZZZZZ*, __*) which ARE in the
+  // definition data. We multiply by 2.5 to account for potentially many hidden members.
+  // Rockwell AOIs/UDTs can have long member names (up to 40 chars).
+  const estimatedBytes = Math.ceil(memberCount * 2.5) * 8 + Math.ceil(memberCount * 2.5) * 40 + 500;
 
   // Template read for Rockwell controllers:
   // Despite CIP spec saying "words", Rockwell interprets the count as BYTES
@@ -307,22 +294,17 @@ async function readTemplateDefinition(
   const allData: Uint8Array[] = [];
   let byteOffset = 0;
 
-  log.eip.info(`Template ${templateId}: need to read ~${estimatedBytes} bytes (${memberCount} members)`);
-
   while (byteOffset < estimatedBytes) {
     // Offset is in 32-bit words
     const wordOffset = Math.floor(byteOffset / 4);
     const bytesRemaining = estimatedBytes - byteOffset;
     const bytesToRead = Math.min(maxBytesPerRead, bytesRemaining);
 
-    log.eip.info(`  Read: wordOffset=${wordOffset}, bytesToRead=${bytesToRead}`);
-
     const request = buildReadTemplateRequest(cip, templateId, wordOffset, bytesToRead);
     const response = await sendRaw(cip, request);
 
     const status = response[42];
     const extStatusSize = response[43];
-    log.eip.info(`  Response: status=0x${status.toString(16)}, extStatus=${extStatusSize}, len=${response.length}`);
 
     // Status 0x00 = success, 0x06 = partial (more data available)
     if (status !== 0x00 && status !== 0x06) {
@@ -330,26 +312,14 @@ async function readTemplateDefinition(
         log.eip.warn(`Template ${templateId} definition read failed: status=0x${status.toString(16)}`);
         return null;
       }
-      // Might have reached end of data
-      log.eip.info(`  Breaking: status 0x${status.toString(16)} after ${byteOffset} bytes`);
       break;
     }
 
     const dataOffset = 44 + extStatusSize * 2;
     const chunk = response.subarray(dataOffset);
 
-    log.eip.info(`  Chunk: dataOffset=${dataOffset}, chunkLen=${chunk.length}`);
-
     if (chunk.length === 0) {
-      log.eip.info(`  Breaking: empty chunk`);
       break;  // No more data
-    }
-
-    // Show first few bytes for debugging
-    if (allData.length === 0) {
-      const preview = Array.from(chunk.subarray(0, Math.min(32, chunk.length)))
-        .map(b => b.toString(16).padStart(2, '0')).join(' ');
-      log.eip.info(`  First bytes: ${preview}`);
     }
 
     allData.push(chunk);
@@ -357,12 +327,9 @@ async function readTemplateDefinition(
 
     // If we got less than requested, we're done
     if (chunk.length < bytesToRead) {
-      log.eip.info(`  Breaking: got ${chunk.length} < requested ${bytesToRead}`);
       break;
     }
   }
-
-  log.eip.info(`Template ${templateId}: read loop done, ${allData.length} chunks, ${byteOffset} bytes`);
 
   if (allData.length === 0) {
     log.eip.warn(`Template ${templateId} definition read returned empty data`);
@@ -377,8 +344,6 @@ async function readTemplateDefinition(
     data.set(chunk, pos);
     pos += chunk.length;
   }
-
-  log.eip.info(`Template ${templateId}: read ${data.length} bytes total`);
 
   if (data.length === 0) {
     log.eip.warn(`Template ${templateId} definition read returned empty data`);
@@ -579,7 +544,7 @@ export async function readTemplate(
   if (actualStringOffset !== estimatedStringOffset) {
     const hiddenBytes = actualStringOffset - estimatedStringOffset;
     const hiddenCount = Math.floor(hiddenBytes / 8);
-    log.eip.info(`Template ${templateId}: detected ${hiddenCount} hidden members (${hiddenBytes} extra bytes in definitions)`);
+    log.eip.debug(`Template ${templateId}: detected ${hiddenCount} hidden members (${hiddenBytes} extra bytes)`);
   }
 
   // Read ALL member definitions up to the string data start
@@ -607,20 +572,12 @@ export async function readTemplate(
   const templateName = templateNameResult.name;
   offset += templateNameResult.length;
 
-  // Debug: show what we have after template name
-  const remainingBytes = definition.length - offset;
-  log.eip.info(`Template ${templateId}: name="${templateName}", ${remainingBytes} bytes remaining for member names`);
-  if (remainingBytes > 0) {
-    const preview = Array.from(definition.subarray(offset, Math.min(offset + 50, definition.length)))
-      .map(b => b.toString(16).padStart(2, '0')).join(' ');
-    log.eip.info(`  First member name bytes: ${preview}`);
-  }
-
   // Read ALL member names - there may be more names than memberCount due to hidden members
   // The string section contains names for all members including hidden ones (ZZZZZ*, __*)
   // which are in the definition data but not counted in memberCount.
   const memberNames: string[] = [];
   const maxNames = memberDefs.length + 10; // Read names for all member definitions + buffer
+  const startOffset = offset;
   while (offset < definition.length && memberNames.length < maxNames) {
     const nameResult = parseNullTerminatedString(definition, offset);
     if (nameResult.str.length > 0) {
@@ -628,18 +585,28 @@ export async function readTemplate(
       offset += nameResult.length;
     } else {
       // Empty string (null byte at start) means we hit padding or end of valid data
+      log.eip.debug(`Template ${templateId}: string parsing stopped at offset ${offset} (null byte)`);
       break;
     }
   }
 
-  // Debug: how many names were parsed
-  log.eip.info(`Template ${templateId}: parsed ${memberNames.length} names for ${memberDefs.length} definitions (reported memberCount=${memberCount})`);
+  // Check if we hit end of buffer before getting all names
+  if (memberNames.length < memberDefs.length && offset >= definition.length) {
+    log.eip.warn(`Template ${templateId}: buffer exhausted at ${offset} bytes, only got ${memberNames.length}/${memberDefs.length} names`);
+  }
 
   // Build member list
   const members: TemplateMember[] = [];
+  let fallbackCount = 0;
   for (let i = 0; i < memberDefs.length; i++) {
     const def = memberDefs[i];
-    const name = memberNames[i] ?? `_member${i}`;
+    let name = memberNames[i];
+
+    if (!name) {
+      // Fallback name - this indicates we didn't read enough template data
+      name = `_member${i}`;
+      fallbackCount++;
+    }
 
     // Skip hidden members (starting with ZZZZZ or __)
     if (name.startsWith("ZZZZZ") || name.startsWith("__")) {
@@ -682,6 +649,10 @@ export async function readTemplate(
     members,
   };
 
+  if (fallbackCount > 0) {
+    log.eip.warn(`Template ${templateId} "${templateName}": ${fallbackCount} members used fallback names (not enough data read)`);
+    log.eip.warn(`  Read ${definition.length} bytes, found ${memberNames.length} names for ${memberDefs.length} definitions`);
+  }
   log.eip.info(`Template ${templateId} "${templateName}": ${members.length} readable members (raw: ${memberCount})`);
   if (members.length > 0) {
     log.eip.debug(`  Members: ${members.map(m => `${m.name}:${m.datatype}`).join(", ")}`);
