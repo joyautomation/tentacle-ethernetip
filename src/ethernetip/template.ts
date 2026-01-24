@@ -111,13 +111,15 @@ function buildTemplateAttributeRequest(
     instanceSegment.encode(false),
   ]);
 
-  // GetAttributeList: get member count and structure handle
-  // Attribute 1 = Structure Handle (4 bytes) - needed to get size
-  // Attribute 2 = Template Member Count (2 bytes)
+  // GetAttributeList: get definition size and member count
+  // CIP Template Object (0x6C) attributes:
+  // - Attribute 1 = Object Definition Size (UDINT, 4 bytes) - size of template data
+  // - Attribute 2 = Structure Handle (UINT, 2 bytes)
+  // - Attribute 3 = Template Member Count (UINT, 2 bytes)
   const attributes = joinBytes([
     encodeUint(2, 2), // Number of attributes
-    encodeUint(1, 2), // Attribute 1: Structure Handle
-    encodeUint(2, 2), // Attribute 2: Member Count
+    encodeUint(1, 2), // Attribute 1: Object Definition Size
+    encodeUint(3, 2), // Attribute 3: Template Member Count (NOT attribute 2!)
   ]);
 
   const cipMessage = joinBytes([
@@ -245,17 +247,18 @@ async function readTemplateAttributes(
 
     if (attrStatus === 0) {
       if (attrId === 1) {
-        // Object Definition Size (UINT, 2 bytes) - size in 32-bit words
-        structureHandle = decodeUint(response.subarray(offset, offset + 2));
-        offset += 2;
-      } else if (attrId === 2) {
-        // Member Count (UINT, 2 bytes)
+        // Object Definition Size (UDINT, 4 bytes) - size of template data in bytes
+        structureHandle = decodeUint(response.subarray(offset, offset + 4));
+        offset += 4;
+      } else if (attrId === 3) {
+        // Template Member Count (UINT, 2 bytes)
         memberCount = decodeUint(response.subarray(offset, offset + 2));
         offset += 2;
       }
     }
   }
 
+  log.eip.info(`Template ${templateId} attributes: definitionSize=${structureHandle} bytes, memberCount=${memberCount}`);
   return { structureHandle, memberCount };
 }
 
