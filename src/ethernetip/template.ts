@@ -152,13 +152,13 @@ function buildTemplateAttributeRequest(
 
 /**
  * Build request to read template definition using Read Tag service
- * Uses class/instance path with offset (words) and element count
+ * Uses class/instance path with offset (words) and byte count
  */
 function buildReadTemplateRequest(
   cip: Cip,
   templateId: number,
   wordOffset: number,
-  wordsToRead: number,
+  bytesToRead: number,
 ): Uint8Array {
   // Path: Template class (0x6C) -> Instance (templateId)
   const classSegment = createLogicalSegment(classCode.templateObject, "classId");
@@ -174,11 +174,10 @@ function buildReadTemplateRequest(
 
   // Read Tag service (0x4C) with:
   // - Offset in 32-bit words (4 bytes)
-  // - Number of 32-bit words to read (2 bytes)
-  // Note: The PLC returns (wordsToRead * 4) bytes of data
+  // - Count: Rockwell interprets this as BYTES to read (2 bytes)
   const requestData = joinBytes([
     encodeUint(wordOffset, 4),
-    encodeUint(wordsToRead, 2),
+    encodeUint(bytesToRead, 2),
   ]);
 
   const cipMessage = joinBytes([
@@ -253,13 +252,9 @@ async function readTemplateAttributes(
         structureHandle = decodeUint(response.subarray(offset, offset + 4));
         offset += 4;
       } else if (attrId === 2) {
-        // Structure Handle (UINT, 2 bytes) - some controllers return member count here
-        const attr2Value = decodeUint(response.subarray(offset, offset + 2));
-        offset += 2;
-        // Use as member count if we don't have one yet (fallback for non-standard controllers)
-        if (memberCount === 0) {
-          memberCount = attr2Value;
-        }
+        // Structure Handle (UDINT, 4 bytes)
+        // Skip it - we don't need this value
+        offset += 4;
       } else if (attrId === 3) {
         // Template Member Count (UINT, 2 bytes) - per CIP spec, this is authoritative
         memberCount = decodeUint(response.subarray(offset, offset + 2));
@@ -291,21 +286,20 @@ async function readTemplateDefinition(
   // Rockwell AOIs/UDTs can have long member names (up to 40 chars), so we estimate generously
   const estimatedBytes = memberCount * 8 + memberCount * 32 + 200;
 
-  // Template read uses 32-bit word addressing:
-  // - wordOffset is in 32-bit words (4 bytes each)
-  // - wordsToRead specifies how many 32-bit words to read
-  // - PLC returns (wordsToRead * 4) bytes of data
-  const maxWordsPerRead = 120;  // 120 words = 480 bytes, safe limit for unconnected messaging
+  // Template read for Rockwell controllers:
+  // Despite CIP spec saying "words", Rockwell interprets the count as BYTES
+  // Offset is still in 32-bit words, but count is bytes to read
+  const maxBytesPerRead = 480;  // Safe limit for unconnected messaging
   const allData: Uint8Array[] = [];
   let byteOffset = 0;
 
   while (byteOffset < estimatedBytes) {
-    // Convert byte offset to word offset (must be aligned to 4-byte boundary)
+    // Offset is in 32-bit words
     const wordOffset = Math.floor(byteOffset / 4);
     const bytesRemaining = estimatedBytes - byteOffset;
-    const wordsToRead = Math.min(maxWordsPerRead, Math.ceil(bytesRemaining / 4));
+    const bytesToRead = Math.min(maxBytesPerRead, bytesRemaining);
 
-    const request = buildReadTemplateRequest(cip, templateId, wordOffset, wordsToRead);
+    const request = buildReadTemplateRequest(cip, templateId, wordOffset, bytesToRead);
     const response = await sendRaw(cip, request);
 
     const status = response[42];
@@ -331,8 +325,7 @@ async function readTemplateDefinition(
     byteOffset += chunk.length;
 
     // If we got less than requested, we're done
-    const expectedBytes = wordsToRead * 4;
-    if (chunk.length < expectedBytes) {
+    if (chunk.length < bytesToRead) {
       break;
     }
   }
