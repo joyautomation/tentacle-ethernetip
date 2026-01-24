@@ -1,7 +1,4 @@
 {
-  "name": "@tentacle/ethernetip",
-  "version": "0.1.0",
-  "exports": "./mod.ts",
   "tasks": {
     "dev": "deno run --watch --allow-net --allow-read --allow-env main.ts",
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
