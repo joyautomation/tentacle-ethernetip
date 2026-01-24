@@ -114,12 +114,14 @@ function buildTemplateAttributeRequest(
   // GetAttributeList: get definition size and member count
   // CIP Template Object (0x6C) attributes:
   // - Attribute 1 = Object Definition Size (UDINT, 4 bytes) - size of template data
-  // - Attribute 2 = Structure Handle (UINT, 2 bytes)
-  // - Attribute 3 = Template Member Count (UINT, 2 bytes)
+  // - Attribute 2 = Structure Handle (UINT, 2 bytes) - some controllers put member count here
+  // - Attribute 3 = Template Member Count (UINT, 2 bytes) - per CIP spec
+  // Request all three for compatibility with different controllers
   const attributes = joinBytes([
-    encodeUint(2, 2), // Number of attributes
+    encodeUint(3, 2), // Number of attributes
     encodeUint(1, 2), // Attribute 1: Object Definition Size
-    encodeUint(3, 2), // Attribute 3: Template Member Count (NOT attribute 2!)
+    encodeUint(2, 2), // Attribute 2: Structure Handle (might be member count on some)
+    encodeUint(3, 2), // Attribute 3: Template Member Count
   ]);
 
   const cipMessage = joinBytes([
@@ -250,8 +252,16 @@ async function readTemplateAttributes(
         // Object Definition Size (UDINT, 4 bytes) - size of template data in bytes
         structureHandle = decodeUint(response.subarray(offset, offset + 4));
         offset += 4;
+      } else if (attrId === 2) {
+        // Structure Handle (UINT, 2 bytes) - some controllers return member count here
+        const attr2Value = decodeUint(response.subarray(offset, offset + 2));
+        offset += 2;
+        // Use as member count if we don't have one yet (fallback for non-standard controllers)
+        if (memberCount === 0) {
+          memberCount = attr2Value;
+        }
       } else if (attrId === 3) {
-        // Template Member Count (UINT, 2 bytes)
+        // Template Member Count (UINT, 2 bytes) - per CIP spec, this is authoritative
         memberCount = decodeUint(response.subarray(offset, offset + 2));
         offset += 2;
       }
