@@ -237,8 +237,14 @@ async function readTemplateAttributes(
   //     - Status (2 bytes) - 0 = success
   //     - Attribute value (if status is 0)
 
+  // Dump raw attribute response data (temporarily using info level for diagnostics)
+  const attrDataPreview = Array.from(response.subarray(offset, Math.min(offset + 40, response.length)))
+    .map(b => b.toString(16).padStart(2, '0')).join(' ');
+  log.eip.info(`Template ${templateId} attr raw at offset ${offset}: ${attrDataPreview}`);
+
   const attrCount = decodeUint(response.subarray(offset, offset + 2));
   offset += 2;
+  log.eip.info(`  attrCount=${attrCount}`);
 
   for (let i = 0; i < attrCount; i++) {
     const attrId = decodeUint(response.subarray(offset, offset + 2));
@@ -246,18 +252,26 @@ async function readTemplateAttributes(
     const attrStatus = decodeUint(response.subarray(offset, offset + 2));
     offset += 2;
 
+    log.eip.info(`  attr[${i}]: id=${attrId}, status=${attrStatus}`);
+
     if (attrStatus === 0) {
       if (attrId === 1) {
         // Object Definition Size (UDINT, 4 bytes) - size of template data in bytes
-        structureHandle = decodeUint(response.subarray(offset, offset + 4));
+        const bytes = response.subarray(offset, offset + 4);
+        structureHandle = decodeUint(bytes);
+        log.eip.info(`    attr1 bytes=[${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}] = ${structureHandle}`);
         offset += 4;
       } else if (attrId === 2) {
         // Structure Handle (UDINT, 4 bytes)
-        // Skip it - we don't need this value
+        const bytes = response.subarray(offset, offset + 4);
+        const value = decodeUint(bytes);
+        log.eip.info(`    attr2 bytes=[${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}] = ${value} (skipped)`);
         offset += 4;
       } else if (attrId === 3) {
         // Template Member Count (UINT, 2 bytes) - per CIP spec, this is authoritative
-        memberCount = decodeUint(response.subarray(offset, offset + 2));
+        const bytes = response.subarray(offset, offset + 2);
+        memberCount = decodeUint(bytes);
+        log.eip.info(`    attr3 bytes=[${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}] = ${memberCount}`);
         offset += 2;
       }
     }
@@ -293,16 +307,23 @@ async function readTemplateDefinition(
   const allData: Uint8Array[] = [];
   let byteOffset = 0;
 
+  log.eip.info(`Template ${templateId}: need to read ~${estimatedBytes} bytes (${memberCount} members)`);
+
   while (byteOffset < estimatedBytes) {
     // Offset is in 32-bit words
     const wordOffset = Math.floor(byteOffset / 4);
     const bytesRemaining = estimatedBytes - byteOffset;
     const bytesToRead = Math.min(maxBytesPerRead, bytesRemaining);
 
+    log.eip.info(`  Read: wordOffset=${wordOffset}, bytesToRead=${bytesToRead}`);
+
     const request = buildReadTemplateRequest(cip, templateId, wordOffset, bytesToRead);
     const response = await sendRaw(cip, request);
 
     const status = response[42];
+    const extStatusSize = response[43];
+    log.eip.info(`  Response: status=0x${status.toString(16)}, extStatus=${extStatusSize}, len=${response.length}`);
+
     // Status 0x00 = success, 0x06 = partial (more data available)
     if (status !== 0x00 && status !== 0x06) {
       if (byteOffset === 0) {
@@ -310,15 +331,25 @@ async function readTemplateDefinition(
         return null;
       }
       // Might have reached end of data
+      log.eip.info(`  Breaking: status 0x${status.toString(16)} after ${byteOffset} bytes`);
       break;
     }
 
-    const extStatusSize = response[43];
     const dataOffset = 44 + extStatusSize * 2;
     const chunk = response.subarray(dataOffset);
 
+    log.eip.info(`  Chunk: dataOffset=${dataOffset}, chunkLen=${chunk.length}`);
+
     if (chunk.length === 0) {
+      log.eip.info(`  Breaking: empty chunk`);
       break;  // No more data
+    }
+
+    // Show first few bytes for debugging
+    if (allData.length === 0) {
+      const preview = Array.from(chunk.subarray(0, Math.min(32, chunk.length)))
+        .map(b => b.toString(16).padStart(2, '0')).join(' ');
+      log.eip.info(`  First bytes: ${preview}`);
     }
 
     allData.push(chunk);
@@ -326,9 +357,12 @@ async function readTemplateDefinition(
 
     // If we got less than requested, we're done
     if (chunk.length < bytesToRead) {
+      log.eip.info(`  Breaking: got ${chunk.length} < requested ${bytesToRead}`);
       break;
     }
   }
+
+  log.eip.info(`Template ${templateId}: read loop done, ${allData.length} chunks, ${byteOffset} bytes`);
 
   if (allData.length === 0) {
     log.eip.warn(`Template ${templateId} definition read returned empty data`);
@@ -364,6 +398,122 @@ function parseNullTerminatedString(data: Uint8Array, offset: number): { str: str
   }
   const str = new TextDecoder().decode(data.subarray(offset, end));
   return { str, length: end - offset + 1 }; // +1 for null terminator
+}
+
+/**
+ * Parse template name which is terminated by semicolon (;) or null byte
+ * Rockwell template format: "name:version:rev;member1\x00member2\x00..."
+ */
+function parseTemplateName(data: Uint8Array, offset: number): { name: string; length: number } {
+  let end = offset;
+  // Find semicolon or null byte, whichever comes first
+  while (end < data.length && data[end] !== 0 && data[end] !== 0x3b) {
+    end++;
+  }
+  const fullName = new TextDecoder().decode(data.subarray(offset, end));
+  // Extract just the template name (before first colon) for display
+  const colonIdx = fullName.indexOf(':');
+  const name = colonIdx > 0 ? fullName.substring(0, colonIdx) : fullName;
+  // Length includes the terminator (semicolon or null)
+  return { name, length: end - offset + 1 };
+}
+
+/**
+ * Find the start of string data in template definition
+ *
+ * The challenge: Rockwell templates include hidden members (ZZZZZ*, __*) in the
+ * member definitions that are NOT counted in memberCount. Additionally, there's
+ * often a "type encoding" section between member definitions and the actual
+ * string data (containing patterns like "AECHAECH..." or "iEBEBEB...").
+ *
+ * Template string data format: "template_name:version:rev;member1\x00member2\x00..."
+ *
+ * We find the string data by looking for the semicolon that ends the template name,
+ * which should be followed by a letter or underscore (start of first member name).
+ * Then we scan backwards to find the start of the template name.
+ */
+function findStringDataOffset(data: Uint8Array, estimatedOffset: number): number {
+  const maxScan = Math.min(estimatedOffset + 1024, data.length - 5);
+
+  // Strategy: Find semicolon followed by a valid member name start (letter, underscore, or ZZZZZ)
+  // This pattern marks: "template:ver:rev;FirstMemberName\0..."
+  for (let i = estimatedOffset; i < maxScan; i++) {
+    if (data[i] === 0x3b) { // semicolon
+      const nextByte = data[i + 1];
+      // Check if next byte starts a member name (letter, underscore, or digit for ZZZZZ...)
+      const isLetter = (nextByte >= 0x41 && nextByte <= 0x5a) || (nextByte >= 0x61 && nextByte <= 0x7a);
+      const isUnderscore = nextByte === 0x5f;
+      const isDigit = nextByte >= 0x30 && nextByte <= 0x39;
+
+      if (isLetter || isUnderscore || isDigit) {
+        // Found the end of template name! Now scan backwards to find the start.
+        // Template names are like "FBD_ONESHOT:1:0" - alphanumeric with underscores and colons
+        // But they DON'T contain the type encoding letters pattern (pure alternating A/B/C/E/H/D)
+
+        let start = i - 1;
+        // Scan backwards to find the start of the template name
+        // Stop when we hit a byte that can't be part of a template name (non-ASCII or null)
+        while (start > estimatedOffset) {
+          const b = data[start];
+          // Valid template name chars: letters, digits, underscore, colon
+          const isValidChar = (b >= 0x41 && b <= 0x5a) || // A-Z
+                              (b >= 0x61 && b <= 0x7a) || // a-z
+                              (b >= 0x30 && b <= 0x39) || // 0-9
+                              b === 0x5f ||               // underscore
+                              b === 0x3a;                 // colon
+          if (!isValidChar) {
+            start++; // Move forward to the first valid char
+            break;
+          }
+          start--;
+        }
+
+        // Verify this looks like a real template name (should have colons for version)
+        const slice = data.subarray(start, i + 1);
+        const str = new TextDecoder().decode(slice);
+        const colonCount = (str.match(/:/g) || []).length;
+
+        // Real template names have at least 2 colons (name:version:rev;)
+        // Type encoding like "AECHAECH" has zero colons
+        if (colonCount >= 1) {
+          log.eip.debug(`  Found template name at offset ${start} (scanned ${start - estimatedOffset} bytes forward): "${str}"`);
+          return start;
+        }
+      }
+    }
+  }
+
+  // Fallback: look for the old pattern (letter followed by colon)
+  for (let offset = estimatedOffset; offset < maxScan; offset++) {
+    const byte = data[offset];
+    const isLetter = (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a);
+
+    if (isLetter) {
+      // Look for version pattern ":digit:" or ":letter:" within reasonable distance
+      for (let i = 1; i < 60 && offset + i + 2 < data.length; i++) {
+        if (data[offset + i] === 0x3a) { // colon
+          const afterColon = data[offset + i + 1];
+          // Check if this looks like version start (letter or digit)
+          const isVersionStart = (afterColon >= 0x41 && afterColon <= 0x5a) ||
+                                 (afterColon >= 0x61 && afterColon <= 0x7a) ||
+                                 (afterColon >= 0x30 && afterColon <= 0x39);
+          if (isVersionStart) {
+            log.eip.debug(`  Found string data at offset ${offset} via fallback pattern`);
+            return offset;
+          }
+        }
+        if (data[offset + i] === 0 || data[offset + i] === 0x3b) {
+          break;
+        }
+        if (data[offset + i] < 0x20 || data[offset + i] > 0x7e) {
+          break;
+        }
+      }
+    }
+  }
+
+  log.eip.debug(`  Could not find string data start, using estimated offset ${estimatedOffset}`);
+  return estimatedOffset;
 }
 
 /**
@@ -418,6 +568,21 @@ export async function readTemplate(
   // - Array info (2 bytes)
   // - Type code (2 bytes)
   // - Offset (4 bytes)
+  //
+  // IMPORTANT: The memberCount from attributes doesn't include hidden members (ZZZZZ*, __*)
+  // but those hidden members ARE in the definition data. We first find where the string
+  // data starts, then read ALL member definitions up to that point.
+
+  const estimatedStringOffset = memberCount * 8;
+  const actualStringOffset = findStringDataOffset(definition, estimatedStringOffset);
+
+  if (actualStringOffset !== estimatedStringOffset) {
+    const hiddenBytes = actualStringOffset - estimatedStringOffset;
+    const hiddenCount = Math.floor(hiddenBytes / 8);
+    log.eip.info(`Template ${templateId}: detected ${hiddenCount} hidden members (${hiddenBytes} extra bytes in definitions)`);
+  }
+
+  // Read ALL member definitions up to the string data start
   const memberDefs: Array<{
     arrayInfo: number;
     typeCode: number;
@@ -425,7 +590,7 @@ export async function readTemplate(
   }> = [];
 
   let offset = 0;
-  for (let i = 0; i < memberCount && offset + 8 <= definition.length; i++) {
+  while (offset + 8 <= actualStringOffset && offset + 8 <= definition.length) {
     const arrayInfo = decodeUint(definition.subarray(offset, offset + 2));
     const typeCode = decodeUint(definition.subarray(offset + 2, offset + 4));
     const memberOffset = decodeUint(definition.subarray(offset + 4, offset + 8));
@@ -433,39 +598,42 @@ export async function readTemplate(
     offset += 8;
   }
 
-  // Second part: member names (null-terminated strings)
-  // First comes the template name, then a semicolon separator, then member names
-  const templateNameResult = parseNullTerminatedString(definition, offset);
-  const templateName = templateNameResult.str;
-  offset += templateNameResult.length;
+  log.eip.debug(`Template ${templateId}: read ${memberDefs.length} member definitions (reported memberCount=${memberCount})`);
 
-  // Skip the semicolon separator between template name and member names
-  // Rockwell templates use ";" as a separator after the template name
-  while (offset < definition.length && (definition[offset] === 0x3b || definition[offset] === 0x00)) {
-    offset++;
-  }
+  // Move to string data start
+  offset = actualStringOffset;
+
+  const templateNameResult = parseTemplateName(definition, offset);
+  const templateName = templateNameResult.name;
+  offset += templateNameResult.length;
 
   // Debug: show what we have after template name
   const remainingBytes = definition.length - offset;
-  log.eip.debug(`Template ${templateId}: after name "${templateName}", remaining ${remainingBytes} bytes at offset ${offset}`);
-  if (remainingBytes > 0 && remainingBytes < 200) {
-    log.eip.debug(`  Raw bytes: ${Array.from(definition.subarray(offset, Math.min(offset + remainingBytes, offset + 100))).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+  log.eip.info(`Template ${templateId}: name="${templateName}", ${remainingBytes} bytes remaining for member names`);
+  if (remainingBytes > 0) {
+    const preview = Array.from(definition.subarray(offset, Math.min(offset + 50, definition.length)))
+      .map(b => b.toString(16).padStart(2, '0')).join(' ');
+    log.eip.info(`  First member name bytes: ${preview}`);
   }
 
+  // Read ALL member names - there may be more names than memberCount due to hidden members
+  // The string section contains names for all members including hidden ones (ZZZZZ*, __*)
+  // which are in the definition data but not counted in memberCount.
   const memberNames: string[] = [];
-  for (let i = 0; i < memberCount && offset < definition.length; i++) {
+  const maxNames = memberDefs.length + 10; // Read names for all member definitions + buffer
+  while (offset < definition.length && memberNames.length < maxNames) {
     const nameResult = parseNullTerminatedString(definition, offset);
     if (nameResult.str.length > 0) {
       memberNames.push(nameResult.str);
+      offset += nameResult.length;
     } else {
-      // Empty string means we hit padding or end of valid data
+      // Empty string (null byte at start) means we hit padding or end of valid data
       break;
     }
-    offset += nameResult.length;
   }
 
   // Debug: how many names were parsed
-  log.eip.info(`Template ${templateId}: parsed ${memberNames.length}/${memberCount} member names`);
+  log.eip.info(`Template ${templateId}: parsed ${memberNames.length} names for ${memberDefs.length} definitions (reported memberCount=${memberCount})`);
 
   // Build member list
   const members: TemplateMember[] = [];

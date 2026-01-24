@@ -30,16 +30,17 @@ const log = createLogger("ethernetip", LogLevel.info);
 // Configuration from environment
 // ═══════════════════════════════════════════════════════════════════════════
 
-function loadEnvConfig(): { natsServers: string; projectId: string } {
+function loadEnvConfig(): { natsServers: string; projectId: string; clearCache: boolean } {
   const natsServers = Deno.env.get("NATS_SERVERS") || "localhost:4222";
   const projectId = Deno.env.get("PROJECT_ID");
+  const clearCache = Deno.env.get("CLEAR_CACHE") === "true" || Deno.args.includes("--clear-cache");
 
   if (!projectId) {
     log.error("PROJECT_ID environment variable is required");
     Deno.exit(1);
   }
 
-  return { natsServers, projectId };
+  return { natsServers, projectId, clearCache };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,6 +64,37 @@ async function connectToNats(servers: string): Promise<NatsConnection> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Cache Management
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { Kvm } from "@nats-io/kv";
+
+async function clearVariableCache(nc: NatsConnection, projectId: string): Promise<void> {
+  try {
+    const kvm = new Kvm(nc);
+    const bucketName = `field-config-${projectId}`;
+    const kv = await kvm.open(bucketName);
+
+    // Find and delete all cache.variables.* keys
+    const keys = await kv.keys("cache.variables.>");
+    let count = 0;
+    for await (const key of keys) {
+      await kv.delete(key);
+      count++;
+      log.info(`  Deleted cache: ${key}`);
+    }
+
+    if (count === 0) {
+      log.info("  No variable cache found to clear");
+    } else {
+      log.info(`  Cleared ${count} variable cache entries`);
+    }
+  } catch (err) {
+    log.warn(`Failed to clear cache: ${err}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -72,7 +104,7 @@ async function main(): Promise<void> {
   log.info("═══════════════════════════════════════════════════════════════");
 
   // Load environment config
-  const { natsServers, projectId } = loadEnvConfig();
+  const { natsServers, projectId, clearCache } = loadEnvConfig();
   log.info(`Project ID: ${projectId}`);
   log.info(`NATS Servers: ${natsServers}`);
 
@@ -88,6 +120,12 @@ async function main(): Promise<void> {
       // The NATS client handles reconnection automatically
     }
   })();
+
+  // Clear variable cache if requested
+  if (clearCache) {
+    log.info("Clearing variable cache (--clear-cache)...");
+    await clearVariableCache(nc, projectId);
+  }
 
   // Create config manager (loads from NATS KV)
   log.info("Loading configuration from NATS KV...");
