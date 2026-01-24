@@ -274,10 +274,10 @@ async function readTemplateDefinition(
   templateId: number,
   memberCount: number,
 ): Promise<Uint8Array | null> {
-  // Calculate needed size: 8 bytes per member definition + ~20 bytes per name + 100 overhead
+  // Calculate needed size: 8 bytes per member definition + ~32 bytes per name + 200 overhead
+  // Rockwell AOIs/UDTs can have long member names (up to 40 chars), so we estimate generously
   // Note: word count in request is interpreted as byte count by the PLC
-  // Cap at 500 "words" (bytes) per request due to unconnected messaging limits
-  const estimatedBytes = memberCount * 8 + memberCount * 20 + 100;
+  const estimatedBytes = memberCount * 8 + memberCount * 32 + 200;
 
   // We may need multiple reads for large templates
   const maxBytesPerRead = 480;  // Safe limit for unconnected messaging
@@ -421,22 +421,33 @@ export async function readTemplate(
   }
 
   // Second part: member names (null-terminated strings)
-  // First comes the template name, then member names
+  // First comes the template name, then a semicolon separator, then member names
   const templateNameResult = parseNullTerminatedString(definition, offset);
   const templateName = templateNameResult.str;
   offset += templateNameResult.length;
 
+  // Skip the semicolon separator between template name and member names
+  // Rockwell templates use ";" as a separator after the template name
+  while (offset < definition.length && (definition[offset] === 0x3b || definition[offset] === 0x00)) {
+    offset++;
+  }
+
   // Debug: show what we have after template name
   const remainingBytes = definition.length - offset;
-  log.eip.info(`Template ${templateId}: after name, remaining ${remainingBytes} bytes at offset ${offset}`);
-  if (remainingBytes > 0 && remainingBytes < 150) {
-    log.eip.info(`  Raw bytes: ${Array.from(definition.subarray(offset, Math.min(offset + remainingBytes, offset + 80))).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+  log.eip.debug(`Template ${templateId}: after name "${templateName}", remaining ${remainingBytes} bytes at offset ${offset}`);
+  if (remainingBytes > 0 && remainingBytes < 200) {
+    log.eip.debug(`  Raw bytes: ${Array.from(definition.subarray(offset, Math.min(offset + remainingBytes, offset + 100))).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
   }
 
   const memberNames: string[] = [];
   for (let i = 0; i < memberCount && offset < definition.length; i++) {
     const nameResult = parseNullTerminatedString(definition, offset);
-    memberNames.push(nameResult.str);
+    if (nameResult.str.length > 0) {
+      memberNames.push(nameResult.str);
+    } else {
+      // Empty string means we hit padding or end of valid data
+      break;
+    }
     offset += nameResult.length;
   }
 
