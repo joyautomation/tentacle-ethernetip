@@ -12,6 +12,7 @@
  */
 
 import { type NatsConnection, type Subscription } from "@nats-io/transport-deno";
+import { jetstream } from "@nats-io/jetstream";
 import {
   createCip,
   destroyCip,
@@ -31,15 +32,19 @@ import type { MqttConfigManager } from "./mqttConfig.ts";
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Simplified tag info for polling (subset of DiscoveredTag)
+ * Cached variable with tag info and last known value
+ * This is stored in NATS KV and persists across restarts
  */
-type PollTag = {
-  name: string;
-  datatype: string;
+type CachedVariable = {
+  name: string;           // tag name / variableId
+  datatype: string;       // PLC datatype (REAL, DINT, etc.)
+  value: number | boolean | string | null;
+  quality: "good" | "bad" | "unknown";
+  lastUpdated: number;
 };
 
 /**
- * Variable with current value (for request/reply)
+ * Variable info for request/reply (API response format)
  */
 type VariableInfo = {
   variableId: string;
@@ -53,11 +58,12 @@ type VariableInfo = {
 type PlcConnection = {
   config: PlcConfig;
   cip: Cip | null;
-  tags: PollTag[];
-  /** Current values for each tag (keyed by variableId) */
-  values: Map<string, VariableInfo>;
+  /** All variables with their current values (keyed by name) */
+  variables: Map<string, CachedVariable>;
   polling: boolean;
   abortController: AbortController;
+  /** Flag to batch cache saves */
+  cacheModified: boolean;
 };
 
 export type ScannerManager = {
@@ -101,6 +107,66 @@ export async function createScanner(
    */
   function sanitizeForSubject(variableId: string): string {
     return variableId.replace(/\./g, "_");
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Tag Cache (NATS KV)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const cacheStreamName = `KV_field-config-${projectId}`;
+  const cacheSubjectPrefix = `$KV.field-config-${projectId}`;
+  const js = jetstream(nc);
+  let jsm: Awaited<ReturnType<typeof js.jetstreamManager>> | null = null;
+
+  async function getJsm() {
+    if (!jsm) {
+      jsm = await js.jetstreamManager();
+    }
+    return jsm;
+  }
+
+  /**
+   * Load cached variables (with values) for a PLC from NATS KV
+   */
+  async function loadVariableCache(plcId: string): Promise<Map<string, CachedVariable>> {
+    const variables = new Map<string, CachedVariable>();
+    try {
+      const manager = await getJsm();
+      const msg = await manager.streams.getMessage(cacheStreamName, {
+        last_by_subj: `${cacheSubjectPrefix}.cache.variables.${plcId}`,
+      });
+      if (msg?.data && msg.data.length > 0) {
+        const cached = JSON.parse(new TextDecoder().decode(msg.data)) as CachedVariable[];
+        for (const v of cached) {
+          variables.set(v.name, v);
+        }
+        log.eip.info(`Loaded ${variables.size} cached variables for PLC ${plcId}`);
+      }
+    } catch {
+      // No cache exists yet
+      log.eip.debug(`No variable cache found for PLC ${plcId}`);
+    }
+    return variables;
+  }
+
+  /**
+   * Save variables (with values) to NATS KV cache
+   */
+  async function saveVariableCache(plcId: string, variables: Map<string, CachedVariable>): Promise<void> {
+    const subject = `${cacheSubjectPrefix}.cache.variables.${plcId}`;
+    const payload = new TextEncoder().encode(JSON.stringify([...variables.values()]));
+    nc.publish(subject, payload);
+    await nc.flush(); // Ensure it's persisted before continuing
+    log.eip.info(`Saved ${variables.size} variables to cache for PLC ${plcId}`);
+  }
+
+  /**
+   * Delete variable cache for a PLC
+   */
+  function deleteVariableCache(plcId: string): void {
+    const subject = `${cacheSubjectPrefix}.cache.variables.${plcId}`;
+    nc.publish(subject, new Uint8Array(0));
+    log.eip.debug(`Cleared variable cache for PLC ${plcId}`);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -164,15 +230,22 @@ export async function createScanner(
     const now = Date.now();
     const natsDatatype = getNatsDatatype(datatype);
 
-    // Store in connection's value cache
-    conn.values.set(variableId, {
-      variableId,
-      value,
-      datatype: natsDatatype,
-      quality,
-      source: "plc",
-      lastUpdated: now,
-    });
+    // Update variable in cache (or create if new)
+    const existing = conn.variables.get(variableId);
+    if (existing) {
+      existing.value = value;
+      existing.quality = quality;
+      existing.lastUpdated = now;
+    } else {
+      conn.variables.set(variableId, {
+        name: variableId,
+        datatype,
+        value,
+        quality,
+        lastUpdated: now,
+      });
+    }
+    conn.cacheModified = true;
 
     // Build message matching PlcDataMessage schema from nats-schema
     const message = {
@@ -203,8 +276,15 @@ export async function createScanner(
     const allVariables: VariableInfo[] = [];
 
     for (const conn of connections.values()) {
-      for (const variable of conn.values.values()) {
-        allVariables.push(variable);
+      for (const cached of conn.variables.values()) {
+        allVariables.push({
+          variableId: cached.name,
+          value: cached.value,
+          datatype: getNatsDatatype(cached.datatype),
+          quality: cached.quality,
+          source: "plc",
+          lastUpdated: cached.lastUpdated,
+        });
       }
     }
 
@@ -264,8 +344,11 @@ export async function createScanner(
 
         log.eip.info(`Found ${atomicTags.length} atomic tags, ${structTags.length} struct tags`);
 
-        // Start with atomic tags
-        conn.tags = atomicTags.map((t) => ({ name: t.name, datatype: t.datatype }));
+        // Build set of discovered tag names with datatypes
+        const discoveredTags = new Map<string, string>(); // name -> datatype
+        for (const t of atomicTags) {
+          discoveredTags.set(t.name, t.datatype);
+        }
 
         // Expand struct tags synchronously (must complete before polling starts)
         if (structTags.length > 0) {
@@ -284,9 +367,9 @@ export async function createScanner(
               // Expand UDT members
               const members = await expandUdtMembers(conn.cip!, structTag.name, templateId);
 
-              // Add expanded members to poll list (already filtered to atomic types)
+              // Add expanded members (already filtered to atomic types)
               for (const member of members) {
-                conn.tags.push({ name: member.path, datatype: member.datatype });
+                discoveredTags.set(member.path, member.datatype);
                 expandedCount++;
               }
             } catch (err) {
@@ -294,17 +377,62 @@ export async function createScanner(
             }
           }
 
-          log.eip.info(`UDT expansion complete: added ${expandedCount} members, total ${conn.tags.length} tags`);
+          log.eip.info(`UDT expansion complete: added ${expandedCount} members, total ${discoveredTags.size} tags`);
         }
 
-        log.eip.info(`Ready to poll ${conn.tags.length} tags for PLC ${plcId}`);
+        // Remove stale variables no longer in PLC
+        const staleKeys = [...conn.variables.keys()].filter(k => !discoveredTags.has(k));
+        if (staleKeys.length > 0) {
+          log.eip.info(`Removing ${staleKeys.length} stale variables no longer in PLC`);
+          for (const key of staleKeys) {
+            conn.variables.delete(key);
+          }
+        }
+
+        // Add new variables (preserve existing values where possible)
+        let newCount = 0;
+        for (const [name, datatype] of discoveredTags) {
+          if (!conn.variables.has(name)) {
+            conn.variables.set(name, {
+              name,
+              datatype,
+              value: null,
+              quality: "unknown",
+              lastUpdated: 0,
+            });
+            newCount++;
+          } else {
+            // Update datatype if changed
+            const existing = conn.variables.get(name)!;
+            if (existing.datatype !== datatype) {
+              existing.datatype = datatype;
+            }
+          }
+        }
+
+        if (newCount > 0) {
+          log.eip.info(`Added ${newCount} new variables from browse`);
+        }
+
+        // Save updated cache
+        conn.cacheModified = true;
+        await saveVariableCache(plcId, conn.variables);
+
+        log.eip.info(`Ready to poll ${conn.variables.size} variables for PLC ${plcId}`);
       } else {
-        // Use configured tags
-        conn.tags = conn.config.tags.map((name) => ({
-          name,
-          datatype: "UNKNOWN",
-        }));
-        log.eip.info(`Using ${conn.tags.length} configured tags for PLC ${plcId}`);
+        // Use configured tags - add to variables if not already present
+        for (const name of conn.config.tags) {
+          if (!conn.variables.has(name)) {
+            conn.variables.set(name, {
+              name,
+              datatype: "UNKNOWN",
+              value: null,
+              quality: "unknown",
+              lastUpdated: 0,
+            });
+          }
+        }
+        log.eip.info(`Using ${conn.variables.size} configured tags for PLC ${plcId}`);
       }
 
       return true;
@@ -327,9 +455,7 @@ export async function createScanner(
       }
       conn.cip = null;
     }
-
-    // Clear cached values
-    conn.values.clear();
+    // Note: Don't clear conn.variables - we want to preserve cached values
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -356,37 +482,44 @@ export async function createScanner(
         }
       }
 
-      // Read all tags (take snapshot to handle background UDT expansion)
-      const tagsToRead = [...conn.tags];
-      log.eip.info(`Poll cycle: ${tagsToRead.length} tags to read (conn.tags has ${conn.tags.length})`);
+      // Read all variables (take snapshot in case browse updates during poll)
+      const variablesToRead = [...conn.variables.values()];
+      log.eip.debug(`Poll cycle: ${variablesToRead.length} variables to read`);
       let readCount = 0;
       let failCount = 0;
-      for (const tag of tagsToRead) {
+      for (const variable of variablesToRead) {
         if (conn.abortController.signal.aborted) break;
 
         try {
-          const response = await readTag(conn.cip!, tag.name);
+          const response = await readTag(conn.cip!, variable.name);
           if (response.success) {
-            const { value } = decodeTagValue(response.data, tag.datatype);
-            // Use original tag name as variableId (preserves UDT path like "MyUDT.Member.Value")
-            publishValue(conn, tag.name, value, tag.datatype, "good");
+            const { value } = decodeTagValue(response.data, variable.datatype);
+            publishValue(conn, variable.name, value, variable.datatype, "good");
             readCount++;
           } else {
             failCount++;
             if (failCount <= 5) {
-              log.eip.info(`Read failed for "${tag.name}": status 0x${response.status.toString(16)}`);
+              log.eip.debug(`Read failed for "${variable.name}": status 0x${response.status.toString(16)}`);
             }
           }
         } catch (err) {
           failCount++;
           if (failCount <= 5) {
-            log.eip.info(`Error reading "${tag.name}": ${err}`);
+            log.eip.debug(`Error reading "${variable.name}": ${err}`);
           }
         }
       }
 
       if (readCount > 0 || failCount > 0) {
-        log.eip.info(`Polling ${plcId}: ${readCount} success, ${failCount} failed, ${conn.values.size} cached`);
+        log.eip.debug(`Polling ${plcId}: ${readCount} success, ${failCount} failed`);
+      }
+
+      // Save cache if modified (batch saves to reduce writes)
+      if (conn.cacheModified) {
+        conn.cacheModified = false;
+        saveVariableCache(plcId, conn.variables).catch((err) => {
+          log.eip.warn(`Failed to save variable cache: ${err}`);
+        });
       }
 
       // Wait for next scan
@@ -409,6 +542,33 @@ export async function createScanner(
         resolve();
       });
     });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Connection Initialization with Cache
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Initialize a PLC connection, loading cached variables (with values) first
+   */
+  async function initConnection(plcId: string, config: PlcConfig): Promise<PlcConnection> {
+    // Load cached variables (including last known values)
+    const cachedVariables = await loadVariableCache(plcId);
+
+    const conn: PlcConnection = {
+      config,
+      cip: null,
+      variables: cachedVariables,
+      polling: false,
+      abortController: new AbortController(),
+      cacheModified: false,
+    };
+
+    if (cachedVariables.size > 0) {
+      log.eip.info(`PLC ${plcId} initialized with ${cachedVariables.size} cached variables (ready to poll)`);
+    }
+
+    return conn;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -438,26 +598,20 @@ export async function createScanner(
           disconnectPlc(plcId);
         }
       } else {
-        // New PLC
-        const conn: PlcConnection = {
-          config,
-          cip: null,
-          tags: [],
-          values: new Map(),
-          polling: false,
-          abortController: new AbortController(),
-        };
-        connections.set(plcId, conn);
-
-        if (config.enabled) {
-          pollPlc(plcId);
-        }
+        // New PLC - initialize with cached tags
+        initConnection(plcId, config).then((conn) => {
+          connections.set(plcId, conn);
+          if (config.enabled) {
+            pollPlc(plcId);
+          }
+        });
       }
     } else if (event.type === "plc-removed") {
       const conn = connections.get(plcId);
       if (conn) {
         conn.abortController.abort();
         disconnectPlc(plcId);
+        deleteVariableCache(plcId);
         connections.delete(plcId);
       }
     }
@@ -477,24 +631,18 @@ export async function createScanner(
       // Start request handler (non-blocking)
       startRequestHandler();
 
-      // Initialize connections for existing PLCs
-      for (const [plcId, plcConfig] of configManager.config.plcs) {
-        const conn: PlcConnection = {
-          config: plcConfig,
-          cip: null,
-          tags: [],
-          values: new Map(),
-          polling: false,
-          abortController: new AbortController(),
-        };
-        connections.set(plcId, conn);
+      // Initialize connections for existing PLCs (async but fire-and-forget)
+      (async () => {
+        for (const [plcId, plcConfig] of configManager.config.plcs) {
+          const conn = await initConnection(plcId, plcConfig);
+          connections.set(plcId, conn);
 
-        if (plcConfig.enabled) {
-          pollPlc(plcId);
+          if (plcConfig.enabled) {
+            pollPlc(plcId);
+          }
         }
-      }
-
-      log.eip.info(`Scanner started with ${connections.size} PLCs configured`);
+        log.eip.info(`Scanner started with ${connections.size} PLCs configured`);
+      })();
     },
 
     async stop() {
