@@ -1,0 +1,21 @@
+# Deno
+.deno/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local config
+.env
+.env.local
+
+# Test fixtures that shouldn't be committed
+Pomona_RTU45v38.L5X
