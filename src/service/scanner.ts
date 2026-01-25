@@ -114,6 +114,9 @@ export async function createScanner(
   // Subscription tracking: variableId -> Set of subscriberIds
   const subscriptions = new Map<string, Set<string>>();
 
+  // MQTT deadband tracking: variableId -> last published value and timestamp
+  const mqttLastPublish = new Map<string, { value: number | boolean | string | null, timestamp: number }>();
+
   // NATS subscriptions
   let variablesSub: Subscription | null = null;
   let browseSub: Subscription | null = null;
@@ -397,16 +400,52 @@ export async function createScanner(
     // Publish to flat subject (internal use, tentacle-graphql)
     nc.publish(dataSubject, payload);
 
-    // Publish to MQTT subject if enabled
+    // Publish to MQTT subject if enabled (with deadband filtering)
     if (mqttConfigManager?.isEnabled(variableId)) {
-      const mqttSubject = `${mqttDataSubjectBase}.${sanitizeForSubject(variableId)}`;
       const rawDeadband = mqttConfigManager.getDeadband(variableId);
-      const deadband = {
-        value: rawDeadband.value,
-        maxTime: rawDeadband.maxTime ? rawDeadband.maxTime / 1000 : undefined,
-      };
-      const mqttMessage = { ...message, deadband };
-      nc.publish(mqttSubject, new TextEncoder().encode(JSON.stringify(mqttMessage)));
+      const lastPublish = mqttLastPublish.get(variableId);
+
+      // Determine if we should publish based on deadband
+      let shouldPublish = false;
+
+      if (!lastPublish) {
+        // First publish for this variable - always publish
+        shouldPublish = true;
+      } else {
+        const timeSinceLastPublish = now - lastPublish.timestamp;
+
+        // Check maxTime (always publish if exceeded)
+        if (rawDeadband.maxTime && timeSinceLastPublish >= rawDeadband.maxTime) {
+          shouldPublish = true;
+        } else if (typeof value === "number" && typeof lastPublish.value === "number") {
+          // Numeric comparison: check if change exceeds deadband threshold
+          const change = Math.abs(value - lastPublish.value);
+          if (change > rawDeadband.value) {
+            shouldPublish = true;
+          }
+        } else if (typeof value === "boolean" || typeof value === "string") {
+          // Boolean/string: publish on any change (deadband.value doesn't apply)
+          if (value !== lastPublish.value) {
+            shouldPublish = true;
+          }
+        }
+      }
+
+      if (shouldPublish) {
+        const mqttSubject = `${mqttDataSubjectBase}.${sanitizeForSubject(variableId)}`;
+        const deadband = {
+          value: rawDeadband.value,
+          maxTime: rawDeadband.maxTime ? rawDeadband.maxTime / 1000 : undefined,
+        };
+        const mqttMessage = { ...message, deadband };
+        nc.publish(mqttSubject, new TextEncoder().encode(JSON.stringify(mqttMessage)));
+
+        // Update last publish tracking
+        mqttLastPublish.set(variableId, { value, timestamp: now });
+        log.eip.debug(`MQTT publish: ${variableId} = ${value} (deadband: ${rawDeadband.value})`);
+      } else {
+        log.eip.debug(`MQTT filtered: ${variableId} = ${value} (within deadband ${rawDeadband.value}, last=${lastPublish?.value})`);
+      }
     }
   }
 

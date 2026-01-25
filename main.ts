@@ -19,10 +19,13 @@
  */
 
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
+import { jetstream } from "@nats-io/jetstream";
+import { Kvm, type KV } from "@nats-io/kv";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 import { createConfigManager } from "./src/service/config.ts";
 import { createMqttConfigManager } from "./src/service/mqttConfig.ts";
 import { createScanner } from "./src/service/scanner.ts";
+import type { ServiceHeartbeat } from "@tentacle/nats-schema";
 
 const log = createLogger("ethernetip", LogLevel.info);
 
@@ -66,8 +69,6 @@ async function connectToNats(servers: string): Promise<NatsConnection> {
 // ═══════════════════════════════════════════════════════════════════════════
 // Cache Management
 // ═══════════════════════════════════════════════════════════════════════════
-
-import { Kvm } from "@nats-io/kv";
 
 async function clearVariableCache(nc: NatsConnection, projectId: string): Promise<void> {
   try {
@@ -142,6 +143,47 @@ async function main(): Promise<void> {
   // Start scanning
   scanner.start();
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Heartbeat publishing for service discovery
+  // ═══════════════════════════════════════════════════════════════════════════
+  const js = jetstream(nc);
+  const kvm = new Kvm(js);
+  const heartbeatsKv = await kvm.create("service_heartbeats", {
+    history: 1,
+    ttl: 60 * 1000, // 1 minute TTL
+  });
+
+  const hostname = Deno.hostname();
+  const instanceId = `${hostname}-${crypto.randomUUID().slice(0, 8)}`;
+  const heartbeatKey = `ethernetip.${instanceId}.${projectId}`;
+  const startedAt = Date.now();
+
+  const publishHeartbeat = async () => {
+    const heartbeat: ServiceHeartbeat = {
+      serviceType: "ethernetip",
+      instanceId,
+      projectId,
+      lastSeen: Date.now(),
+      startedAt,
+      metadata: {
+        plcCount: configManager.config.plcs.size,
+      },
+    };
+    try {
+      const encoder = new TextEncoder();
+      await heartbeatsKv.put(heartbeatKey, encoder.encode(JSON.stringify(heartbeat)));
+    } catch (err) {
+      log.warn(`Failed to publish heartbeat: ${err}`);
+    }
+  };
+
+  // Publish initial heartbeat
+  await publishHeartbeat();
+  log.info(`Service heartbeat started (instance: ${instanceId})`);
+
+  // Publish heartbeat every 10 seconds
+  const heartbeatInterval = setInterval(publishHeartbeat, 10000);
+
   log.info("");
   log.info("Service running. Press Ctrl+C to stop.");
   log.info("");
@@ -156,6 +198,15 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     log.info(`Received ${signal}, shutting down...`);
+
+    // Stop heartbeat publishing
+    clearInterval(heartbeatInterval);
+    try {
+      await heartbeatsKv.delete(heartbeatKey);
+      log.info("Removed service heartbeat");
+    } catch {
+      // Ignore - may already be expired
+    }
 
     // Stop scanner
     await scanner.stop();

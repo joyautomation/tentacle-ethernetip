@@ -1,6 +1,6 @@
 {
   "tasks": {
-    "dev": "deno run --env-file=.env --watch --allow-net --allow-read --allow-env main.ts",
+    "dev": "deno run --env-file=.env --watch --allow-all main.ts",
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
     "test": "deno test --allow-net --allow-read"
   },
@@ -10,7 +10,8 @@
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3",
     "@nats-io/kv": "jsr:@nats-io/kv@3",
     "@std/assert": "jsr:@std/assert@1",
-    "@std/path": "jsr:@std/path@1"
+    "@std/path": "jsr:@std/path@1",
+    "@tentacle/nats-schema": "file:///home/joyja/Development/nats-schema/src/mod.ts"
   },
   "compilerOptions": {
     "strict": true
