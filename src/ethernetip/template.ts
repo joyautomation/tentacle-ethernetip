@@ -628,6 +628,9 @@ export async function readTemplate(
       size = info.size;
     }
 
+    // Log all member parsing for debugging datatype issues
+    log.eip.debug(`Template ${templateId}: member[${i}] "${name}" typeCode=0x${def.typeCode.toString(16)} -> ${datatype} (isStruct=${isStruct})`);
+
     // Log suspicious members: short uppercase names that are atomic but might be structs
     if (!isStruct && datatype !== "UNKNOWN" && name.length <= 4 && name === name.toUpperCase() && /^[A-Z]+$/.test(name)) {
       log.eip.debug(`Template ${templateId}: suspicious atomic member "${name}" (typeCode=0x${def.typeCode.toString(16)}, datatype=${datatype})`);

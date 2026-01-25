@@ -176,7 +176,7 @@ export async function createScanner(
     const payload = new TextEncoder().encode(JSON.stringify(validVariables));
     nc.publish(subject, payload);
     await nc.flush(); // Ensure it's persisted before continuing
-    log.eip.info(`Saved ${validVariables.size} variables to cache for PLC ${plcId} (filtered ${variables.size - validVariables.size} invalid)`);
+    log.eip.info(`Saved ${validVariables.length} variables to cache for PLC ${plcId} (filtered ${variables.size - validVariables.length} invalid)`);
   }
 
   /**
@@ -235,6 +235,27 @@ export async function createScanner(
     return "string";
   }
 
+  /**
+   * Map CIP typeCode to PLC datatype string
+   * Used to correct cached datatypes from template parsing errors
+   */
+  function typeCodeToDatatype(typeCode: number): string | null {
+    const TYPE_MAP: Record<number, string> = {
+      0xc1: "BOOL",
+      0xc2: "SINT",
+      0xc3: "INT",
+      0xc4: "DINT",
+      0xc5: "LINT",
+      0xc6: "USINT",
+      0xc7: "UINT",
+      0xc8: "UDINT",
+      0xc9: "ULINT",
+      0xca: "REAL",
+      0xcb: "LREAL",
+    };
+    return TYPE_MAP[typeCode] ?? null;
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Publishing (pub/sub only, no KV)
   // ─────────────────────────────────────────────────────────────────────────
@@ -247,7 +268,23 @@ export async function createScanner(
     quality: "good" | "bad" = "good",
   ): void {
     const now = Date.now();
-    const natsDatatype = getNatsDatatype(datatype);
+    let natsDatatype = getNatsDatatype(datatype);
+
+    // Failsafe: infer correct datatype from actual value
+    // This handles cases where template parsing returns wrong datatypes (e.g., BOOL for REAL)
+    if (typeof value === "number" && natsDatatype !== "number") {
+      log.eip.debug(`Datatype mismatch for ${variableId}: cached=${datatype}, value is number, correcting to "number"`);
+      natsDatatype = "number";
+      // Update cached datatype to prevent repeated corrections
+      const cached = conn.variables.get(variableId);
+      if (cached) cached.datatype = "REAL";
+    } else if (typeof value === "boolean" && natsDatatype !== "boolean") {
+      log.eip.debug(`Datatype mismatch for ${variableId}: cached=${datatype}, value is boolean, correcting to "boolean"`);
+      natsDatatype = "boolean";
+      // Update cached datatype to prevent repeated corrections
+      const cached = conn.variables.get(variableId);
+      if (cached) cached.datatype = "BOOL";
+    }
 
     // Update variable in cache (or create if new)
     const existing = conn.variables.get(variableId);
@@ -283,7 +320,18 @@ export async function createScanner(
     // Only publish to MQTT subject if variable is explicitly enabled
     if (mqttConfigManager?.isEnabled(variableId)) {
       const mqttSubject = `${mqttDataSubjectBase}.${sanitizeForSubject(variableId)}`;
-      nc.publish(mqttSubject, payload);
+      // Include deadband config so tentacle-mqtt can pass it to synapse for RBE
+      // Convert maxTime from ms to seconds (synapse expects seconds)
+      const rawDeadband = mqttConfigManager.getDeadband(variableId);
+      const deadband = {
+        value: rawDeadband.value,
+        maxTime: rawDeadband.maxTime ? rawDeadband.maxTime / 1000 : undefined,
+      };
+      const mqttMessage = {
+        ...message,
+        deadband,
+      };
+      nc.publish(mqttSubject, new TextEncoder().encode(JSON.stringify(mqttMessage)));
     }
   }
 
@@ -538,7 +586,16 @@ export async function createScanner(
         try {
           const response = await readTag(conn.cip!, variable.name);
           if (response.success) {
-            const { value } = decodeTagValue(response.data, variable.datatype);
+            const { value, typeCode } = decodeTagValue(response.data, variable.datatype);
+
+            // Proactively correct cached datatype if PLC response differs from template
+            const actualDatatype = typeCodeToDatatype(typeCode);
+            if (actualDatatype && actualDatatype !== variable.datatype) {
+              log.eip.debug(`Correcting datatype for ${variable.name}: ${variable.datatype} -> ${actualDatatype} (typeCode=0x${typeCode.toString(16)})`);
+              variable.datatype = actualDatatype;
+              conn.cacheModified = true;
+            }
+
             publishValue(conn, variable.name, value, variable.datatype, "good");
             readCount++;
           } else {
