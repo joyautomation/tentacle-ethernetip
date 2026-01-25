@@ -352,21 +352,28 @@ export async function createScanner(
       log.eip.debug(`Datatype mismatch for ${variableId}: cached=${datatype}, correcting to "number"`);
       natsDatatype = "number";
       const cached = conn.variables.get(variableId);
-      if (cached) cached.datatype = "REAL";
+      if (cached) {
+        cached.datatype = "REAL";
+        conn.cacheModified = true; // Save cache when datatype is corrected
+      }
     } else if (typeof value === "boolean" && natsDatatype !== "boolean") {
       log.eip.debug(`Datatype mismatch for ${variableId}: cached=${datatype}, correcting to "boolean"`);
       natsDatatype = "boolean";
       const cached = conn.variables.get(variableId);
-      if (cached) cached.datatype = "BOOL";
+      if (cached) {
+        cached.datatype = "BOOL";
+        conn.cacheModified = true; // Save cache when datatype is corrected
+      }
     }
 
-    // Update variable in cache
+    // Update variable in memory (not persisted to cache on every update)
     const existing = conn.variables.get(variableId);
     if (existing) {
       existing.value = value;
       existing.quality = quality;
       existing.lastUpdated = now;
     } else {
+      // New variable discovered during polling - this is unusual but save it
       conn.variables.set(variableId, {
         name: variableId,
         datatype,
@@ -374,8 +381,8 @@ export async function createScanner(
         quality,
         lastUpdated: now,
       });
+      conn.cacheModified = true;
     }
-    conn.cacheModified = true;
 
     const message = {
       projectId,
