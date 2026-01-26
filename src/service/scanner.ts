@@ -50,6 +50,7 @@ type CachedVariable = {
  * Variable info for request/reply (API response format)
  */
 type VariableInfo = {
+  deviceId: string;
   variableId: string;
   value: number | boolean | string | null;
   datatype: string;
@@ -57,6 +58,8 @@ type VariableInfo = {
   source: string;
   lastUpdated: number;
 };
+
+type ConnectionState = "disconnected" | "connecting" | "connected";
 
 type PlcConnection = {
   config: PlcConfig;
@@ -67,6 +70,18 @@ type PlcConnection = {
   abortController: AbortController;
   /** Flag to batch cache saves */
   cacheModified: boolean;
+  /** Current connection state for observability */
+  connectionState: ConnectionState;
+  /** Number of consecutive connection failures (for exponential backoff) */
+  consecutiveFailures: number;
+  /** Timestamp of last successful read */
+  lastSuccessfulRead: number;
+  /** Timestamp of last connection attempt */
+  lastConnectAttempt: number;
+  /** Total successful reads since last connect */
+  totalReads: number;
+  /** Total failed reads since last connect */
+  totalFailures: number;
 };
 
 /**
@@ -231,6 +246,7 @@ export async function createScanner(
    */
   async function loadVariableCache(plcId: string): Promise<Map<string, CachedVariable>> {
     const variables = new Map<string, CachedVariable>();
+    let corrected = false;
     try {
       const manager = await getJsm();
       const msg = await manager.streams.getMessage(cacheStreamName, {
@@ -239,9 +255,29 @@ export async function createScanner(
       if (msg?.data && msg.data.length > 0) {
         const cached = JSON.parse(new TextDecoder().decode(msg.data)) as CachedVariable[];
         for (const v of cached) {
+          // Correct datatype based on actual value if there's a mismatch
+          // This fixes issues where UDT members were incorrectly typed during initial browse
+          if (v.value !== null && v.value !== undefined) {
+            if (typeof v.value === "number" && v.datatype === "BOOL") {
+              log.eip.info(`Correcting cached datatype for ${v.name}: BOOL -> REAL (value is number)`);
+              v.datatype = "REAL";
+              corrected = true;
+            } else if (typeof v.value === "boolean" && v.datatype !== "BOOL") {
+              log.eip.info(`Correcting cached datatype for ${v.name}: ${v.datatype} -> BOOL (value is boolean)`);
+              v.datatype = "BOOL";
+              corrected = true;
+            }
+          }
           variables.set(v.name, v);
         }
         log.eip.info(`Loaded ${variables.size} cached variables for PLC ${plcId}`);
+
+        // Save corrected cache if any datatypes were fixed
+        if (corrected) {
+          saveVariableCache(plcId, variables).catch(err => {
+            log.eip.warn(`Failed to save corrected cache: ${err}`);
+          });
+        }
       }
     } catch {
       log.eip.debug(`No variable cache found for PLC ${plcId}`);
@@ -281,26 +317,53 @@ export async function createScanner(
     const typeCode = decodeUint(data.subarray(0, 2));
     const valueData = data.subarray(2);
 
-    if (datatype === "REAL" || typeCode === 0xca) {
+    // IMPORTANT: Prioritize typeCode from actual PLC response over cached datatype.
+    // The cached datatype may be wrong due to template parsing issues, but the
+    // typeCode in the response is always correct from the PLC.
+    if (typeCode === 0xca) {  // REAL
       return { value: decodeFloat32(valueData), typeCode };
-    } else if (datatype === "LREAL" || typeCode === 0xcb) {
+    } else if (typeCode === 0xcb) {  // LREAL
       const view = new DataView(valueData.buffer, valueData.byteOffset, 8);
       return { value: view.getFloat64(0, true), typeCode };
-    } else if (datatype === "BOOL" || typeCode === 0xc1) {
+    } else if (typeCode === 0xc1) {  // BOOL
       return { value: valueData[0] !== 0, typeCode };
-    } else if (datatype === "SINT" || typeCode === 0xc2) {
+    } else if (typeCode === 0xc2) {  // SINT
       return { value: new Int8Array(valueData.buffer, valueData.byteOffset, 1)[0], typeCode };
-    } else if (datatype === "INT" || typeCode === 0xc3) {
+    } else if (typeCode === 0xc3) {  // INT
       const view = new DataView(valueData.buffer, valueData.byteOffset, 2);
       return { value: view.getInt16(0, true), typeCode };
-    } else if (datatype === "DINT" || typeCode === 0xc4) {
+    } else if (typeCode === 0xc4) {  // DINT
       const view = new DataView(valueData.buffer, valueData.byteOffset, 4);
       return { value: view.getInt32(0, true), typeCode };
-    } else if (datatype === "USINT" || typeCode === 0xc6) {
+    } else if (typeCode === 0xc6) {  // USINT
       return { value: valueData[0], typeCode };
-    } else if (datatype === "UINT" || typeCode === 0xc7) {
+    } else if (typeCode === 0xc7) {  // UINT
       return { value: decodeUint(valueData.subarray(0, 2)), typeCode };
-    } else if (datatype === "UDINT" || typeCode === 0xc8) {
+    } else if (typeCode === 0xc8) {  // UDINT
+      return { value: decodeUint(valueData.subarray(0, 4)), typeCode };
+    }
+
+    // Fallback: use cached datatype for unknown type codes (e.g., UDT types)
+    if (datatype === "REAL") {
+      return { value: decodeFloat32(valueData), typeCode };
+    } else if (datatype === "LREAL") {
+      const view = new DataView(valueData.buffer, valueData.byteOffset, 8);
+      return { value: view.getFloat64(0, true), typeCode };
+    } else if (datatype === "BOOL") {
+      return { value: valueData[0] !== 0, typeCode };
+    } else if (datatype === "SINT") {
+      return { value: new Int8Array(valueData.buffer, valueData.byteOffset, 1)[0], typeCode };
+    } else if (datatype === "INT") {
+      const view = new DataView(valueData.buffer, valueData.byteOffset, 2);
+      return { value: view.getInt16(0, true), typeCode };
+    } else if (datatype === "DINT") {
+      const view = new DataView(valueData.buffer, valueData.byteOffset, 4);
+      return { value: view.getInt32(0, true), typeCode };
+    } else if (datatype === "USINT") {
+      return { value: valueData[0], typeCode };
+    } else if (datatype === "UINT") {
+      return { value: decodeUint(valueData.subarray(0, 2)), typeCode };
+    } else if (datatype === "UDINT") {
       return { value: decodeUint(valueData.subarray(0, 4)), typeCode };
     } else {
       const hex = Array.from(valueData.slice(0, 8))
@@ -389,6 +452,7 @@ export async function createScanner(
 
     const message = {
       projectId,
+      deviceId: conn.config.id,
       variableId,
       value,
       timestamp: now,
@@ -523,7 +587,7 @@ export async function createScanner(
       log.eip.info(`UDT expansion complete: ${expandedCount} members, total ${discoveredTags.size} tags`);
     }
 
-    // Update cache with discovered tags (preserve existing values)
+    // Update cache with discovered tags (preserve existing values AND corrected datatypes)
     for (const [name, datatype] of discoveredTags) {
       if (!conn.variables.has(name)) {
         conn.variables.set(name, {
@@ -535,8 +599,15 @@ export async function createScanner(
         });
       } else {
         const existing = conn.variables.get(name)!;
-        if (existing.datatype !== datatype) {
+        // Only update datatype from template if the existing variable has never been read successfully.
+        // If value is not null, the datatype may have been corrected based on actual PLC response,
+        // which is more reliable than template parsing. Template parsing can have alignment issues
+        // that cause wrong datatypes, but actual PLC reads always return the correct type code.
+        if (existing.value === null && existing.datatype !== datatype) {
+          log.eip.debug(`Updating datatype for unread variable ${name}: ${existing.datatype} -> ${datatype}`);
           existing.datatype = datatype;
+        } else if (existing.value !== null && existing.datatype !== datatype) {
+          log.eip.debug(`Preserving corrected datatype for ${name}: keeping ${existing.datatype} (template says ${datatype})`);
         }
       }
     }
@@ -547,6 +618,48 @@ export async function createScanner(
       conn.variables.delete(key);
     }
 
+    // Read values for all discovered tags once (so UI shows actual values instead of null/unknown)
+    const variablesToRead = [...conn.variables.values()].filter(v => v.value === null);
+    if (variablesToRead.length > 0) {
+      log.eip.info(`Reading initial values for ${variablesToRead.length} tags...`);
+      let readCount = 0;
+      let failCount = 0;
+
+      for (const variable of variablesToRead) {
+        try {
+          const response = await readTag(conn.cip!, variable.name);
+          if (response.success) {
+            const { value, typeCode } = decodeTagValue(response.data, variable.datatype);
+
+            // Correct cached datatype based on actual PLC response
+            const actualDatatype = typeCodeToDatatype(typeCode);
+            if (actualDatatype && actualDatatype !== variable.datatype) {
+              log.eip.debug(`Correcting datatype for ${variable.name}: ${variable.datatype} -> ${actualDatatype}`);
+              variable.datatype = actualDatatype;
+            }
+
+            variable.value = value;
+            variable.quality = "good";
+            variable.lastUpdated = Date.now();
+            readCount++;
+          } else {
+            failCount++;
+            log.eip.debug(`Initial read failed for "${variable.name}": status 0x${response.status.toString(16)}`);
+          }
+        } catch (err) {
+          failCount++;
+          log.eip.debug(`Error reading "${variable.name}": ${err}`);
+        }
+
+        // Log progress every 100 tags
+        if ((readCount + failCount) % 100 === 0) {
+          log.eip.info(`  Progress: ${readCount + failCount}/${variablesToRead.length} tags read...`);
+        }
+      }
+
+      log.eip.info(`Initial value read complete: ${readCount} success, ${failCount} failed`);
+    }
+
     await saveVariableCache(plcId, conn.variables);
 
     log.eip.info(`Browse complete: ${conn.variables.size} tags cached for PLC ${plcId}`);
@@ -554,14 +667,24 @@ export async function createScanner(
     // Return as VariableInfo array
     return [...conn.variables.values()]
       .filter(v => isValidTagName(v.name))
-      .map(v => ({
-        variableId: v.name,
-        value: v.value,
-        datatype: getNatsDatatype(v.datatype),
-        quality: v.quality,
-        source: "plc",
-        lastUpdated: v.lastUpdated,
-      }));
+      .map(v => {
+        // Infer correct datatype from actual value (same failsafe as publishValue)
+        let datatype = getNatsDatatype(v.datatype);
+        if (typeof v.value === "number" && datatype !== "number") {
+          datatype = "number";
+        } else if (typeof v.value === "boolean" && datatype !== "boolean") {
+          datatype = "boolean";
+        }
+        return {
+          deviceId: plcId,
+          variableId: v.name,
+          value: v.value,
+          datatype,
+          quality: v.quality,
+          source: "plc",
+          lastUpdated: v.lastUpdated,
+        };
+      });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -571,15 +694,24 @@ export async function createScanner(
   function getAllVariables(): VariableInfo[] {
     const allVariables: VariableInfo[] = [];
 
-    for (const conn of connections.values()) {
+    for (const [plcId, conn] of connections.entries()) {
       for (const cached of conn.variables.values()) {
         if (/_member\d+$/.test(cached.name)) continue;
         if (!/^[\x20-\x7E]+$/.test(cached.name)) continue;
 
+        // Infer correct datatype from actual value (same failsafe as publishValue)
+        let datatype = getNatsDatatype(cached.datatype);
+        if (typeof cached.value === "number" && datatype !== "number") {
+          datatype = "number";
+        } else if (typeof cached.value === "boolean" && datatype !== "boolean") {
+          datatype = "boolean";
+        }
+
         allVariables.push({
+          deviceId: plcId,
           variableId: cached.name,
           value: cached.value,
-          datatype: getNatsDatatype(cached.datatype),
+          datatype,
           quality: cached.quality,
           source: "plc",
           lastUpdated: cached.lastUpdated,
@@ -682,22 +814,44 @@ export async function createScanner(
   // PLC Connection Management
   // ─────────────────────────────────────────────────────────────────────────
 
+  /** Calculate exponential backoff delay: 2^failures seconds, capped at 60s */
+  function getBackoffDelay(failures: number): number {
+    const baseDelay = 2000; // 2 seconds
+    const maxDelay = 60000; // 60 seconds
+    const delay = Math.min(baseDelay * Math.pow(2, failures), maxDelay);
+    return delay;
+  }
+
   async function connectPlc(plcId: string): Promise<boolean> {
     const conn = connections.get(plcId);
     if (!conn) return false;
     if (conn.cip) return true;
 
+    conn.connectionState = "connecting";
+    conn.lastConnectAttempt = Date.now();
+
     try {
-      log.eip.info(`Connecting to PLC ${plcId} at ${conn.config.host}:${conn.config.port}...`);
+      log.eip.info(`[${plcId}] Connecting to ${conn.config.host}:${conn.config.port}...`);
       conn.cip = await createCip({
         host: conn.config.host,
         port: conn.config.port,
       });
-      log.eip.info(`Connected to PLC ${plcId}: ${conn.cip.identity?.productName || "Unknown"}`);
+
+      // Success - reset failure count and update state
+      conn.connectionState = "connected";
+      conn.consecutiveFailures = 0;
+      conn.totalReads = 0;
+      conn.totalFailures = 0;
+      log.eip.info(`[${plcId}] Connected to ${conn.cip.identity?.productName || "Unknown"}`);
       return true;
     } catch (err) {
-      log.eip.error(`Failed to connect to PLC ${plcId}: ${err}`);
+      conn.connectionState = "disconnected";
+      conn.consecutiveFailures++;
       conn.cip = null;
+
+      const backoff = getBackoffDelay(conn.consecutiveFailures);
+      log.eip.warn(`[${plcId}] Connection failed (attempt ${conn.consecutiveFailures}): ${err}`);
+      log.eip.info(`[${plcId}] Will retry in ${(backoff / 1000).toFixed(1)}s`);
       return false;
     }
   }
@@ -707,12 +861,14 @@ export async function createScanner(
     if (!conn) return;
 
     if (conn.cip) {
+      log.eip.info(`[${plcId}] Disconnecting...`);
       try {
         await destroyCip(conn.cip);
       } catch {
         // Ignore disconnect errors
       }
       conn.cip = null;
+      conn.connectionState = "disconnected";
     }
   }
 
@@ -725,7 +881,11 @@ export async function createScanner(
     if (!conn || !conn.config.enabled) return;
 
     conn.polling = true;
-    log.eip.info(`Starting polling loop for PLC ${plcId} (${conn.config.scanRate}ms)`);
+    log.eip.info(`[${plcId}] Starting polling loop (scan rate: ${conn.config.scanRate}ms)`);
+
+    // For periodic status logging
+    let lastStatusLog = Date.now();
+    const STATUS_LOG_INTERVAL = 30000; // Log status every 30 seconds
 
     while (!conn.abortController.signal.aborted && conn.config.enabled) {
       const startTime = Date.now();
@@ -734,17 +894,28 @@ export async function createScanner(
       const subscribedTags = getSubscribedTags();
 
       if (subscribedTags.size === 0) {
-        // No subscriptions - sleep and check again
+        if (conn.connectionState === "connected") {
+          log.eip.info(`[${plcId}] No subscribed tags, waiting...`);
+        }
         await sleep(1000, conn.abortController.signal);
         continue;
       }
 
-      // Ensure connected
+      // Ensure connected (with exponential backoff on failures)
       if (!conn.cip) {
+        const backoffDelay = getBackoffDelay(conn.consecutiveFailures);
+        const timeSinceLastAttempt = Date.now() - conn.lastConnectAttempt;
+
+        // Wait for backoff period before retrying
+        if (conn.consecutiveFailures > 0 && timeSinceLastAttempt < backoffDelay) {
+          const remaining = backoffDelay - timeSinceLastAttempt;
+          await sleep(Math.min(remaining, 1000), conn.abortController.signal);
+          continue;
+        }
+
         const connected = await connectPlc(plcId);
         if (!connected) {
-          await sleep(5000, conn.abortController.signal);
-          continue;
+          continue; // Backoff handled in connectPlc
         }
       }
 
@@ -757,9 +928,11 @@ export async function createScanner(
         continue;
       }
 
-      log.eip.debug(`Poll cycle: ${variablesToRead.length} subscribed tags to read`);
       let readCount = 0;
       let failCount = 0;
+      let connectionError = false;
+      const wasFirstRead = conn.totalReads === 0;
+      const sampleValues: string[] = []; // Collect sample values to log
 
       for (const variable of variablesToRead) {
         if (conn.abortController.signal.aborted) break;
@@ -772,29 +945,71 @@ export async function createScanner(
             // Proactively correct cached datatype
             const actualDatatype = typeCodeToDatatype(typeCode);
             if (actualDatatype && actualDatatype !== variable.datatype) {
-              log.eip.debug(`Correcting datatype for ${variable.name}: ${variable.datatype} -> ${actualDatatype}`);
+              log.eip.debug(`[${plcId}] Correcting datatype for ${variable.name}: ${variable.datatype} -> ${actualDatatype}`);
               variable.datatype = actualDatatype;
               conn.cacheModified = true;
             }
 
+            // Collect sample values for logging (first 2 tags)
+            if (sampleValues.length < 2) {
+              const shortName = variable.name.length > 30 ? "..." + variable.name.slice(-27) : variable.name;
+              sampleValues.push(`${shortName}=${value}`);
+            }
+
             publishValue(conn, variable.name, value, variable.datatype, "good");
             readCount++;
+            conn.lastSuccessfulRead = Date.now();
           } else {
             failCount++;
-            if (failCount <= 5) {
-              log.eip.debug(`Read failed for "${variable.name}": status 0x${response.status.toString(16)}`);
+            if (failCount <= 3) {
+              log.eip.debug(`[${plcId}] Read failed for "${variable.name}": status 0x${response.status.toString(16)}`);
             }
           }
         } catch (err) {
           failCount++;
-          if (failCount <= 5) {
-            log.eip.debug(`Error reading "${variable.name}": ${err}`);
+          // Check if this is a connection error
+          const errStr = String(err);
+          if (errStr.includes("connection") || errStr.includes("socket") || errStr.includes("ECONNRESET") || errStr.includes("timeout")) {
+            connectionError = true;
+            log.eip.warn(`[${plcId}] Connection error during read: ${err}`);
+            break;
+          }
+          if (failCount <= 3) {
+            log.eip.debug(`[${plcId}] Error reading "${variable.name}": ${err}`);
           }
         }
       }
 
+      // Update statistics
+      conn.totalReads += readCount;
+      conn.totalFailures += failCount;
+
+      // Log first successful read (confirms data is flowing)
+      if (wasFirstRead && readCount > 0) {
+        log.eip.info(`[${plcId}] Data flowing: ${sampleValues.join(", ")}${variablesToRead.length > 2 ? ` (+${variablesToRead.length - 2} more)` : ""}`);
+      }
+
+      // Handle connection errors - force reconnect
+      if (connectionError) {
+        log.eip.warn(`[${plcId}] Lost connection, will reconnect...`);
+        conn.cip = null;
+        conn.connectionState = "disconnected";
+        conn.consecutiveFailures++;
+        continue;
+      }
+
+      // Periodic status logging (every 30s, with sample values)
+      const now = Date.now();
+      if (now - lastStatusLog >= STATUS_LOG_INTERVAL && readCount > 0) {
+        const sampleStr = sampleValues.length > 0 ? ` [${sampleValues.join(", ")}]` : "";
+        log.eip.info(`[${plcId}] Polling ${variablesToRead.length} tags @ ${conn.config.scanRate}ms` +
+          ` (${conn.totalReads} reads, ${conn.totalFailures} failures)${sampleStr}`);
+        lastStatusLog = now;
+      }
+
+      // Log summary at debug level
       if (readCount > 0 || failCount > 0) {
-        log.eip.debug(`Polling ${plcId}: ${readCount} success, ${failCount} failed`);
+        log.eip.debug(`[${plcId}] Poll: ${readCount}/${variablesToRead.length} success, ${failCount} failed`);
       }
 
       // Save cache if modified
@@ -814,7 +1029,8 @@ export async function createScanner(
     }
 
     conn.polling = false;
-    log.eip.info(`Stopped polling for PLC ${plcId}`);
+    conn.connectionState = "disconnected";
+    log.eip.info(`[${plcId}] Polling stopped (total reads: ${conn.totalReads}, failures: ${conn.totalFailures})`);
   }
 
   async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -841,6 +1057,12 @@ export async function createScanner(
       polling: false,
       abortController: new AbortController(),
       cacheModified: false,
+      connectionState: "disconnected",
+      consecutiveFailures: 0,
+      lastSuccessfulRead: 0,
+      lastConnectAttempt: 0,
+      totalReads: 0,
+      totalFailures: 0,
     };
 
     if (cachedVariables.size > 0) {
@@ -861,6 +1083,39 @@ export async function createScanner(
     if (enabledTags.length > 0) {
       subscribeTags(enabledTags, "mqtt");
       log.eip.info(`Auto-subscribed ${enabledTags.length} MQTT-enabled tags`);
+    }
+  }
+
+  /**
+   * Handle MQTT config changes - sync subscriptions with enabled tags
+   */
+  function handleMqttConfigChange(): void {
+    if (!mqttConfigManager) return;
+
+    const enabledTags = new Set(mqttConfigManager.getEnabledVariables());
+    const currentMqttTags = new Set<string>();
+
+    // Find all tags currently subscribed by "mqtt"
+    for (const [tag, subscribers] of subscriptions) {
+      if (subscribers.has("mqtt")) {
+        currentMqttTags.add(tag);
+      }
+    }
+
+    // Subscribe newly enabled tags
+    const toSubscribe = [...enabledTags].filter(tag => !currentMqttTags.has(tag));
+    if (toSubscribe.length > 0) {
+      subscribeTags(toSubscribe, "mqtt");
+    }
+
+    // Unsubscribe disabled tags
+    const toUnsubscribe = [...currentMqttTags].filter(tag => !enabledTags.has(tag));
+    if (toUnsubscribe.length > 0) {
+      unsubscribeTags(toUnsubscribe, "mqtt");
+    }
+
+    if (toSubscribe.length > 0 || toUnsubscribe.length > 0) {
+      log.eip.info(`MQTT subscriptions updated: +${toSubscribe.length} -${toUnsubscribe.length}, total: ${enabledTags.size}`);
     }
   }
 
@@ -916,6 +1171,7 @@ export async function createScanner(
 
       // Subscribe to config changes
       configManager.onChange(handleConfigChange);
+      mqttConfigManager?.onChange(handleMqttConfigChange);
 
       // Start request handlers
       startRequestHandlers();

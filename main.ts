@@ -76,13 +76,13 @@ async function clearVariableCache(nc: NatsConnection, projectId: string): Promis
     const bucketName = `field-config-${projectId}`;
     const kv = await kvm.open(bucketName);
 
-    // Find and delete all cache.variables.* keys
+    // Find and purge all cache.variables.* keys (purge removes history, delete just adds tombstone)
     const keys = await kv.keys("cache.variables.>");
     let count = 0;
     for await (const key of keys) {
-      await kv.delete(key);
+      await kv.purge(key);
       count++;
-      log.info(`  Deleted cache: ${key}`);
+      log.info(`  Purged cache: ${key}`);
     }
 
     if (count === 0) {
