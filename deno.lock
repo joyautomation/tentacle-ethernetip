@@ -3,6 +3,7 @@
   "specifiers": {
     "jsr:@joyautomation/coral@^0.0.12": "0.0.12",
     "jsr:@joyautomation/dark-matter@^0.0.26": "0.0.26",
+    "jsr:@joyautomation/nats-schema@^0.0.2": "0.0.2",
     "jsr:@joyautomation/synapse@*": "0.0.85",
     "jsr:@nats-io/jetstream@3": "3.3.0",
     "jsr:@nats-io/jetstream@3.3.0": "3.3.0",
@@ -13,7 +14,7 @@
     "jsr:@nats-io/transport-deno@3": "3.3.0",
     "jsr:@std/assert@1": "1.0.14",
     "jsr:@std/bytes@^1.0.5": "1.0.6",
-    "jsr:@std/fmt@^1.0.2": "1.0.8",
+    "jsr:@std/fmt@^1.0.2": "1.0.9",
     "jsr:@std/internal@^1.0.10": "1.0.10",
     "jsr:@std/io@0.225.2": "0.225.2",
     "jsr:@std/path@1": "1.1.2",
@@ -32,6 +33,9 @@
     },
     "@joyautomation/dark-matter@0.0.26": {
       "integrity": "7276ddefea2448937b72ada91b3adb86efe4f01032c1dd7915900b59201cba2e"
+    },
+    "@joyautomation/nats-schema@0.0.2": {
+      "integrity": "8011be6c8314f9b25d54702d8890307851918cd275645464853e25082a4d38f0"
     },
     "@joyautomation/synapse@0.0.85": {
       "integrity": "ec54b5d32006daf1fb538b1f0bdb3d8394282eb60e26142267083930e55d5d60",
@@ -91,6 +95,9 @@
     },
     "@std/fmt@1.0.8": {
       "integrity": "71e1fc498787e4434d213647a6e43e794af4fd393ef8f52062246e06f7e372b7"
+    },
+    "@std/fmt@1.0.9": {
+      "integrity": "2487343e8899fb2be5d0e3d35013e54477ada198854e52dd05ed0422eddcabe0"
     },
     "@std/internal@1.0.10": {
       "integrity": "e3be62ce42cab0e177c27698e5d9800122f67b766a0bea6ca4867886cbde8cf7"
@@ -439,6 +446,7 @@
   "workspace": {
     "dependencies": [
       "jsr:@joyautomation/coral@^0.0.12",
+      "jsr:@joyautomation/nats-schema@^0.0.2",
       "jsr:@nats-io/jetstream@3",
       "jsr:@nats-io/kv@3",
       "jsr:@nats-io/transport-deno@3",
