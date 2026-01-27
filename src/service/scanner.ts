@@ -20,15 +20,18 @@ import {
   createCip,
   destroyCip,
   readTag,
+  writeTag,
   browseTags,
   expandUdtMembers,
   getTemplateId,
   type Cip,
 } from "../ethernetip/mod.ts";
-import { decodeFloat32, decodeUint } from "../ethernetip/encode.ts";
+import { decodeFloat32, decodeUint, encodeUint } from "../ethernetip/encode.ts";
 import { log } from "../utils/logger.ts";
 import type { PlcConfig, ConfigManager, ConfigChangeEvent } from "./config.ts";
 import type { MqttConfigManager } from "./mqttConfig.ts";
+import type { BrowsePhase, BrowseProgressMessage } from "@tentacle/nats-schema";
+import { NATS_TOPICS, substituteTopic } from "@tentacle/nats-schema";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -97,6 +100,8 @@ type SubscribeRequest = {
  */
 type BrowseRequest = {
   plcId?: string;  // Optional: browse specific PLC, or all if omitted
+  browseId?: string;  // Optional: unique ID for async browse with progress tracking
+  async?: boolean;  // Optional: if true, return immediately and publish progress
 };
 
 export type ScannerManager = {
@@ -137,6 +142,7 @@ export async function createScanner(
   let browseSub: Subscription | null = null;
   let subscribeSub: Subscription | null = null;
   let unsubscribeSub: Subscription | null = null;
+  let writeSub: Subscription | null = null;
 
   // NATS subjects
   const dataSubject = `plc.data.${projectId}`;
@@ -145,6 +151,9 @@ export async function createScanner(
   const browseSubject = `plc.browse.${projectId}`;
   const subscribeSubject = `plc.subscribe.${projectId}`;
   const unsubscribeSubject = `plc.unsubscribe.${projectId}`;
+  // Write subject matches what tentacle-mqtt publishes for DCMD: ${projectId}/${variableId}
+  // Since NATS uses . as delimiter and variableId may contain dots, we subscribe broadly
+  const writeSubjectPrefix = `${projectId}/`;
 
   /**
    * Sanitize variableId for use in NATS subject
@@ -399,6 +408,107 @@ export async function createScanner(
     return TYPE_MAP[typeCode] ?? null;
   }
 
+  /**
+   * Map PLC datatype string to CIP typeCode
+   */
+  function datatypeToTypeCode(datatype: string): number | null {
+    const TYPE_MAP: Record<string, number> = {
+      "BOOL": 0xc1,
+      "SINT": 0xc2,
+      "INT": 0xc3,
+      "DINT": 0xc4,
+      "LINT": 0xc5,
+      "USINT": 0xc6,
+      "UINT": 0xc7,
+      "UDINT": 0xc8,
+      "ULINT": 0xc9,
+      "REAL": 0xca,
+      "LREAL": 0xcb,
+    };
+    return TYPE_MAP[datatype] ?? null;
+  }
+
+  /**
+   * Encode a JS value to Uint8Array for writing to PLC
+   */
+  function encodeTagValue(
+    value: number | boolean | string,
+    datatype: string,
+  ): Uint8Array | null {
+    // Parse string values to appropriate type
+    let numValue: number;
+    if (typeof value === "string") {
+      if (datatype === "BOOL") {
+        const lower = value.toLowerCase();
+        return new Uint8Array([lower === "true" || lower === "1" ? 1 : 0]);
+      }
+      numValue = parseFloat(value);
+      if (isNaN(numValue)) {
+        log.eip.warn(`Cannot parse "${value}" as number for datatype ${datatype}`);
+        return null;
+      }
+    } else if (typeof value === "boolean") {
+      return new Uint8Array([value ? 1 : 0]);
+    } else {
+      numValue = value;
+    }
+
+    switch (datatype) {
+      case "BOOL":
+        return new Uint8Array([numValue !== 0 ? 1 : 0]);
+      case "SINT": {
+        const buf = new ArrayBuffer(1);
+        new DataView(buf).setInt8(0, numValue);
+        return new Uint8Array(buf);
+      }
+      case "INT": {
+        const buf = new ArrayBuffer(2);
+        new DataView(buf).setInt16(0, numValue, true);
+        return new Uint8Array(buf);
+      }
+      case "DINT": {
+        const buf = new ArrayBuffer(4);
+        new DataView(buf).setInt32(0, numValue, true);
+        return new Uint8Array(buf);
+      }
+      case "LINT": {
+        const buf = new ArrayBuffer(8);
+        new DataView(buf).setBigInt64(0, BigInt(Math.floor(numValue)), true);
+        return new Uint8Array(buf);
+      }
+      case "USINT":
+        return new Uint8Array([numValue & 0xff]);
+      case "UINT": {
+        const buf = new ArrayBuffer(2);
+        new DataView(buf).setUint16(0, numValue, true);
+        return new Uint8Array(buf);
+      }
+      case "UDINT": {
+        const buf = new ArrayBuffer(4);
+        new DataView(buf).setUint32(0, numValue, true);
+        return new Uint8Array(buf);
+      }
+      case "ULINT": {
+        const buf = new ArrayBuffer(8);
+        new DataView(buf).setBigUint64(0, BigInt(Math.floor(numValue)), true);
+        return new Uint8Array(buf);
+      }
+      case "REAL": {
+        const buf = new ArrayBuffer(4);
+        new DataView(buf).setFloat32(0, numValue, true);
+        return new Uint8Array(buf);
+      }
+      case "LREAL": {
+        const buf = new ArrayBuffer(8);
+        new DataView(buf).setFloat64(0, numValue, true);
+        return new Uint8Array(buf);
+      }
+      default:
+        log.eip.warn(`Unsupported datatype for write: ${datatype}`);
+        return null;
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Publishing (pub/sub only, no KV)
   // ─────────────────────────────────────────────────────────────────────────
@@ -514,17 +624,52 @@ export async function createScanner(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Browse Progress Publishing
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Publish browse progress update to NATS
+   */
+  function publishBrowseProgress(
+    browseId: string,
+    deviceId: string,
+    phase: BrowsePhase,
+    totalTags: number,
+    completedTags: number,
+    errorCount: number,
+    message?: string,
+  ): void {
+    const progressMessage: BrowseProgressMessage = {
+      browseId,
+      projectId,
+      deviceId,
+      phase,
+      totalTags,
+      completedTags,
+      errorCount,
+      message,
+      timestamp: Date.now(),
+    };
+    const subject = substituteTopic(NATS_TOPICS.plc.browseProgress, { browseId });
+    nc.publish(subject, new TextEncoder().encode(JSON.stringify(progressMessage)));
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Browse Handler (on-demand)
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
    * Browse tags from PLC and update cache
    * Does NOT start polling - just discovers available tags
+   * If browseId is provided, publishes progress updates to NATS
    */
-  async function browseAndCacheTags(plcId: string): Promise<VariableInfo[]> {
+  async function browseAndCacheTags(plcId: string, browseId?: string): Promise<VariableInfo[]> {
     const conn = connections.get(plcId);
     if (!conn) {
       log.eip.warn(`Browse requested for unknown PLC: ${plcId}`);
+      if (browseId) {
+        publishBrowseProgress(browseId, plcId, "failed", 0, 0, 1, `Unknown PLC: ${plcId}`);
+      }
       return [];
     }
 
@@ -532,6 +677,9 @@ export async function createScanner(
     if (!conn.cip) {
       try {
         log.eip.info(`Connecting to PLC ${plcId} for browse...`);
+        if (browseId) {
+          publishBrowseProgress(browseId, plcId, "discovering", 0, 0, 0, "Connecting to PLC...");
+        }
         conn.cip = await createCip({
           host: conn.config.host,
           port: conn.config.port,
@@ -539,11 +687,17 @@ export async function createScanner(
         log.eip.info(`Connected to PLC ${plcId}: ${conn.cip.identity?.productName || "Unknown"}`);
       } catch (err) {
         log.eip.error(`Failed to connect to PLC ${plcId} for browse: ${err}`);
+        if (browseId) {
+          publishBrowseProgress(browseId, plcId, "failed", 0, 0, 1, `Connection failed: ${err}`);
+        }
         return [];
       }
     }
 
     log.eip.info(`Browsing tags for PLC ${plcId}...`);
+    if (browseId) {
+      publishBrowseProgress(browseId, plcId, "discovering", 0, 0, 0, "Discovering tags from PLC...");
+    }
     const allTags = await browseTags(conn.cip);
 
     const atomicTags = allTags.filter(
@@ -565,7 +719,11 @@ export async function createScanner(
     // Expand struct tags
     if (structTags.length > 0) {
       log.eip.info(`Expanding ${structTags.length} struct tags...`);
+      if (browseId) {
+        publishBrowseProgress(browseId, plcId, "expanding", structTags.length, 0, 0, `Expanding ${structTags.length} struct tags...`);
+      }
       let expandedCount = 0;
+      let structsProcessed = 0;
 
       for (const structTag of structTags) {
         try {
@@ -581,6 +739,11 @@ export async function createScanner(
           }
         } catch (err) {
           log.eip.debug(`Failed to expand ${structTag.name}: ${err}`);
+        }
+        structsProcessed++;
+        // Publish progress every 10 struct tags
+        if (browseId && structsProcessed % 10 === 0) {
+          publishBrowseProgress(browseId, plcId, "expanding", structTags.length, structsProcessed, 0, `Expanded ${structsProcessed}/${structTags.length} structs (${expandedCount} members)`);
         }
       }
 
@@ -622,6 +785,9 @@ export async function createScanner(
     const variablesToRead = [...conn.variables.values()].filter(v => v.value === null);
     if (variablesToRead.length > 0) {
       log.eip.info(`Reading initial values for ${variablesToRead.length} tags...`);
+      if (browseId) {
+        publishBrowseProgress(browseId, plcId, "reading", variablesToRead.length, 0, 0, `Reading values for ${variablesToRead.length} tags...`);
+      }
       let readCount = 0;
       let failCount = 0;
 
@@ -651,18 +817,32 @@ export async function createScanner(
           log.eip.debug(`Error reading "${variable.name}": ${err}`);
         }
 
+        const totalProcessed = readCount + failCount;
+        // Publish progress every 50 tags for smooth UI updates
+        if (browseId && totalProcessed % 50 === 0) {
+          publishBrowseProgress(browseId, plcId, "reading", variablesToRead.length, totalProcessed, failCount, `Read ${totalProcessed}/${variablesToRead.length} tags`);
+        }
         // Log progress every 100 tags
-        if ((readCount + failCount) % 100 === 0) {
-          log.eip.info(`  Progress: ${readCount + failCount}/${variablesToRead.length} tags read...`);
+        if (totalProcessed % 100 === 0) {
+          log.eip.info(`  Progress: ${totalProcessed}/${variablesToRead.length} tags read...`);
         }
       }
 
       log.eip.info(`Initial value read complete: ${readCount} success, ${failCount} failed`);
     }
 
+    if (browseId) {
+      publishBrowseProgress(browseId, plcId, "caching", conn.variables.size, 0, 0, "Saving to cache...");
+    }
+
     await saveVariableCache(plcId, conn.variables);
 
     log.eip.info(`Browse complete: ${conn.variables.size} tags cached for PLC ${plcId}`);
+
+    // Publish completion
+    if (browseId) {
+      publishBrowseProgress(browseId, plcId, "completed", conn.variables.size, conn.variables.size, 0, `Browse complete: ${conn.variables.size} tags`);
+    }
 
     // Return as VariableInfo array
     return [...conn.variables.values()]
@@ -685,6 +865,94 @@ export async function createScanner(
           lastUpdated: v.lastUpdated,
         };
       });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Write Handler (from MQTT DCMD via tentacle-mqtt)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Find which PLC has a variable and return the connection
+   */
+  function findPlcWithVariable(variableId: string): PlcConnection | null {
+    for (const conn of connections.values()) {
+      if (conn.variables.has(variableId)) {
+        return conn;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Handle write request from MQTT DCMD
+   * Subject format: ${projectId}/${variableId}
+   * Payload: string value
+   */
+  async function handleWriteCommand(subject: string, data: Uint8Array): Promise<void> {
+    // Extract variableId from subject
+    if (!subject.startsWith(writeSubjectPrefix)) {
+      return;
+    }
+    const variableId = subject.slice(writeSubjectPrefix.length);
+    if (!variableId) {
+      log.eip.warn(`Write command with empty variableId: ${subject}`);
+      return;
+    }
+
+    // Parse value from payload (tentacle-mqtt sends String(convertedValue))
+    const valueStr = new TextDecoder().decode(data);
+    log.eip.info(`Write command received: ${variableId} = ${valueStr}`);
+
+    // Find which PLC has this variable
+    const conn = findPlcWithVariable(variableId);
+    if (!conn) {
+      log.eip.warn(`Write failed: variable "${variableId}" not found in any PLC cache`);
+      return;
+    }
+
+    // Get variable info for datatype
+    const variable = conn.variables.get(variableId);
+    if (!variable) {
+      log.eip.warn(`Write failed: variable "${variableId}" not in cache`);
+      return;
+    }
+
+    // Ensure PLC is connected
+    if (!conn.cip) {
+      log.eip.warn(`Write failed: PLC ${conn.config.id} not connected`);
+      return;
+    }
+
+    // Get CIP type code
+    const typeCode = datatypeToTypeCode(variable.datatype);
+    if (typeCode === null) {
+      log.eip.warn(`Write failed: unsupported datatype "${variable.datatype}" for ${variableId}`);
+      return;
+    }
+
+    // Encode value
+    const encodedValue = encodeTagValue(valueStr, variable.datatype);
+    if (!encodedValue) {
+      log.eip.warn(`Write failed: could not encode value "${valueStr}" for datatype ${variable.datatype}`);
+      return;
+    }
+
+    // Write to PLC
+    try {
+      const response = await writeTag(conn.cip, variableId, typeCode, encodedValue);
+      if (response.success) {
+        log.eip.info(`Write success: ${variableId} = ${valueStr} (${variable.datatype})`);
+        // Update cached value
+        variable.value = variable.datatype === "BOOL"
+          ? (valueStr.toLowerCase() === "true" || valueStr === "1")
+          : parseFloat(valueStr);
+        variable.lastUpdated = Date.now();
+      } else {
+        log.eip.warn(`Write failed: ${variableId} - CIP status 0x${response.status.toString(16)}`);
+      }
+    } catch (err) {
+      log.eip.error(`Write error for ${variableId}: ${err}`);
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -752,16 +1020,45 @@ export async function createScanner(
             request = JSON.parse(new TextDecoder().decode(msg.data));
           }
 
+          // Generate browseId if async mode or if one was provided
+          const browseId = request.browseId || (request.async ? crypto.randomUUID() : undefined);
+
+          // Async mode: return immediately with browseId, run browse in background
+          if (request.async && browseId) {
+            log.eip.info(`Browse request (async): starting browse with ID ${browseId}`);
+            msg.respond(new TextEncoder().encode(JSON.stringify({ browseId })));
+
+            // Run browse in background
+            (async () => {
+              try {
+                if (request.plcId) {
+                  await browseAndCacheTags(request.plcId, browseId);
+                } else {
+                  for (const plcId of connections.keys()) {
+                    await browseAndCacheTags(plcId, browseId);
+                  }
+                }
+              } catch (err) {
+                log.eip.error(`Async browse failed: ${err}`);
+                if (browseId) {
+                  publishBrowseProgress(browseId, request.plcId || "all", "failed", 0, 0, 1, `Browse failed: ${err}`);
+                }
+              }
+            })();
+            continue;
+          }
+
+          // Sync mode: wait for browse to complete and return results
           const results: VariableInfo[] = [];
 
           if (request.plcId) {
             // Browse specific PLC
-            const plcResults = await browseAndCacheTags(request.plcId);
+            const plcResults = await browseAndCacheTags(request.plcId, browseId);
             results.push(...plcResults);
           } else {
             // Browse all PLCs
             for (const plcId of connections.keys()) {
-              const plcResults = await browseAndCacheTags(plcId);
+              const plcResults = await browseAndCacheTags(plcId, browseId);
               results.push(...plcResults);
             }
           }
@@ -805,6 +1102,23 @@ export async function createScanner(
         } catch (err) {
           log.eip.error(`Error handling unsubscribe request: ${err}`);
           msg.respond(new TextEncoder().encode(JSON.stringify({ success: false, error: String(err) })));
+        }
+      }
+    })();
+
+    // Write command handler (from tentacle-mqtt DCMD)
+    // Subscribe to all subjects and filter for ${projectId}/* pattern
+    // This is necessary because NATS wildcards can't match the ${projectId}/${variableId} format
+    writeSub = nc.subscribe(">");
+    log.eip.info(`Listening for write commands on ${writeSubjectPrefix}*`);
+
+    (async () => {
+      for await (const msg of writeSub!) {
+        // Filter for our projectId
+        if (msg.subject.startsWith(writeSubjectPrefix)) {
+          handleWriteCommand(msg.subject, msg.data).catch((err) => {
+            log.eip.error(`Error handling write command: ${err}`);
+          });
         }
       }
     })();
@@ -1202,6 +1516,7 @@ export async function createScanner(
       browseSub?.unsubscribe();
       subscribeSub?.unsubscribe();
       unsubscribeSub?.unsubscribe();
+      writeSub?.unsubscribe();
 
       // Stop all polling loops
       for (const [plcId, conn] of connections) {
