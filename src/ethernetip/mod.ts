@@ -14,8 +14,9 @@ export {
   writeTag,
   getAttributeSingle,
   setAttributeSingle,
+  readMultipleTags,
 } from "./request.ts";
-export type { CipResponse } from "./request.ts";
+export type { CipResponse, BatchReadResult } from "./request.ts";
 
 // Services and class codes
 export {

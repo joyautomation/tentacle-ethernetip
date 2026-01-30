@@ -20,11 +20,13 @@ import {
   createCip,
   destroyCip,
   readTag,
+  readMultipleTags,
   writeTag,
   browseTags,
   expandUdtMembers,
   getTemplateId,
   type Cip,
+  type BatchReadResult,
 } from "../ethernetip/mod.ts";
 import { decodeFloat32, decodeUint, encodeUint } from "../ethernetip/encode.ts";
 import { log } from "../utils/logger.ts";
@@ -621,6 +623,124 @@ export async function createScanner(
         log.eip.debug(`MQTT filtered: ${variableId} = ${value} (within deadband ${rawDeadband.value}, last=${lastPublish?.value})`);
       }
     }
+  }
+
+  /**
+   * Batch publish multiple values in a single NATS message
+   * Used after batch CIP reads to efficiently send all values at once
+   */
+  function publishBatch(
+    conn: PlcConnection,
+    values: { variableId: string; value: number | boolean | string; datatype: string }[],
+  ): void {
+    if (values.length === 0) return;
+
+    const now = Date.now();
+    const batchMessages: Array<{
+      variableId: string;
+      value: number | boolean | string;
+      datatype: string;
+      deadband?: { value: number; maxTime?: number };
+    }> = [];
+    const mqttBatchMessages: Array<{
+      variableId: string;
+      value: number | boolean | string;
+      datatype: string;
+      deadband: { value: number; maxTime?: number };
+    }> = [];
+
+    for (const { variableId, value, datatype } of values) {
+      let natsDatatype = getNatsDatatype(datatype);
+
+      // Failsafe: infer correct datatype from actual value
+      if (typeof value === "number" && natsDatatype !== "number") {
+        natsDatatype = "number";
+        const cached = conn.variables.get(variableId);
+        if (cached) {
+          cached.datatype = "REAL";
+          conn.cacheModified = true;
+        }
+      } else if (typeof value === "boolean" && natsDatatype !== "boolean") {
+        natsDatatype = "boolean";
+        const cached = conn.variables.get(variableId);
+        if (cached) {
+          cached.datatype = "BOOL";
+          conn.cacheModified = true;
+        }
+      }
+
+      // Update variable in memory
+      const existing = conn.variables.get(variableId);
+      if (existing) {
+        existing.value = value;
+        existing.quality = "good";
+        existing.lastUpdated = now;
+      }
+
+      // Add to batch for internal subject
+      batchMessages.push({ variableId, value, datatype: natsDatatype });
+
+      // Check MQTT publishing with deadband filtering
+      if (mqttConfigManager?.isEnabled(variableId)) {
+        const rawDeadband = mqttConfigManager.getDeadband(variableId);
+        const lastPublish = mqttLastPublish.get(variableId);
+
+        let shouldPublish = false;
+
+        if (!lastPublish) {
+          shouldPublish = true;
+        } else {
+          const timeSinceLastPublish = now - lastPublish.timestamp;
+
+          if (rawDeadband.maxTime && timeSinceLastPublish >= rawDeadband.maxTime) {
+            shouldPublish = true;
+          } else if (typeof value === "number" && typeof lastPublish.value === "number") {
+            const change = Math.abs(value - lastPublish.value);
+            if (change > rawDeadband.value) {
+              shouldPublish = true;
+            }
+          } else if (typeof value === "boolean" || typeof value === "string") {
+            if (value !== lastPublish.value) {
+              shouldPublish = true;
+            }
+          }
+        }
+
+        if (shouldPublish) {
+          const deadband = {
+            value: rawDeadband.value,
+            maxTime: rawDeadband.maxTime ? rawDeadband.maxTime / 1000 : undefined,
+          };
+          mqttBatchMessages.push({ variableId, value, datatype: natsDatatype, deadband });
+          mqttLastPublish.set(variableId, { value, timestamp: now });
+        }
+      }
+    }
+
+    // Publish batch to internal subject (single message with all values)
+    const batchPayload = {
+      projectId,
+      deviceId: conn.config.id,
+      timestamp: now,
+      values: batchMessages,
+    };
+    nc.publish(dataSubject, new TextEncoder().encode(JSON.stringify(batchPayload)));
+
+    // Publish MQTT batch if any values passed deadband filtering
+    if (mqttBatchMessages.length > 0) {
+      const mqttBatchPayload = {
+        projectId,
+        deviceId: conn.config.id,
+        timestamp: now,
+        values: mqttBatchMessages,
+      };
+      // Use a batch subject for MQTT
+      const mqttBatchSubject = `${mqttDataSubjectBase}.batch`;
+      nc.publish(mqttBatchSubject, new TextEncoder().encode(JSON.stringify(mqttBatchPayload)));
+      log.eip.debug(`MQTT batch publish: ${mqttBatchMessages.length} values`);
+    }
+
+    log.eip.debug(`Batch published ${batchMessages.length} values (${mqttBatchMessages.length} to MQTT)`);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1248,13 +1368,24 @@ export async function createScanner(
       const wasFirstRead = conn.totalReads === 0;
       const sampleValues: string[] = []; // Collect sample values to log
 
-      for (const variable of variablesToRead) {
-        if (conn.abortController.signal.aborted) break;
+      // Batch read using Multiple Service Request
+      const tagNames = variablesToRead.map(v => v.name);
+      const variableMap = new Map(variablesToRead.map(v => [v.name, v]));
 
-        try {
-          const response = await readTag(conn.cip!, variable.name);
-          if (response.success) {
-            const { value, typeCode } = decodeTagValue(response.data, variable.datatype);
+      try {
+        const results = await readMultipleTags(conn.cip!, tagNames);
+
+        // Collect successful reads for batch publishing
+        const valuesToPublish: { variableId: string; value: number | boolean | string; datatype: string }[] = [];
+
+        for (const result of results) {
+          if (conn.abortController.signal.aborted) break;
+
+          const variable = variableMap.get(result.tagName);
+          if (!variable) continue;
+
+          if (result.response.success) {
+            const { value, typeCode } = decodeTagValue(result.response.data, variable.datatype);
 
             // Proactively correct cached datatype
             const actualDatatype = typeCodeToDatatype(typeCode);
@@ -1270,27 +1401,30 @@ export async function createScanner(
               sampleValues.push(`${shortName}=${value}`);
             }
 
-            publishValue(conn, variable.name, value, variable.datatype, "good");
+            valuesToPublish.push({ variableId: variable.name, value, datatype: variable.datatype });
             readCount++;
-            conn.lastSuccessfulRead = Date.now();
           } else {
             failCount++;
             if (failCount <= 3) {
-              log.eip.debug(`[${plcId}] Read failed for "${variable.name}": status 0x${response.status.toString(16)}`);
+              log.eip.debug(`[${plcId}] Read failed for "${variable.name}": status 0x${result.response.status.toString(16)}`);
             }
           }
-        } catch (err) {
-          failCount++;
-          // Check if this is a connection error
-          const errStr = String(err);
-          if (errStr.includes("connection") || errStr.includes("socket") || errStr.includes("ECONNRESET") || errStr.includes("timeout")) {
-            connectionError = true;
-            log.eip.warn(`[${plcId}] Connection error during read: ${err}`);
-            break;
-          }
-          if (failCount <= 3) {
-            log.eip.debug(`[${plcId}] Error reading "${variable.name}": ${err}`);
-          }
+        }
+
+        // Batch publish all values
+        if (valuesToPublish.length > 0) {
+          publishBatch(conn, valuesToPublish);
+          conn.lastSuccessfulRead = Date.now();
+        }
+      } catch (err) {
+        // Check if this is a connection error
+        const errStr = String(err);
+        if (errStr.includes("connection") || errStr.includes("socket") || errStr.includes("ECONNRESET") || errStr.includes("timeout")) {
+          connectionError = true;
+          log.eip.warn(`[${plcId}] Connection error during batch read: ${err}`);
+        } else {
+          log.eip.warn(`[${plcId}] Batch read error: ${err}`);
+          failCount = variablesToRead.length;
         }
       }
 
