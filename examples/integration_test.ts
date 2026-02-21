@@ -20,13 +20,13 @@ import {
 // Configuration
 const PLC_HOST = "client4";
 const NATS_URL = "nats://localhost:4222";
-const PROJECT_ID = "ethernetip-test";
+const MODULE_ID = "ethernetip";
 
-// NATS topic pattern from nats-schema: plc.data.{projectId}.{variableId}
-const NATS_TOPIC = `plc.data.${PROJECT_ID}`;
+// NATS topic pattern from nats-schema: {moduleId}.data.{variableId}
+const NATS_TOPIC = `${MODULE_ID}.data`;
 
 // KV bucket for variables (used by tentacle-graphql)
-const KV_BUCKET = `plc-variables-${PROJECT_ID}`;
+const KV_BUCKET = "plc-cache";
 
 // Helpers
 function toHex(data: Uint8Array): string {
@@ -162,12 +162,12 @@ async function main() {
       // Publish to NATS if connected
       if (nc && kvPut) {
         const message = {
-          projectId: PROJECT_ID,
+          moduleId: MODULE_ID,
           variableId: tag.name,
           value,
           lastUpdated: Date.now(),
           datatype: tag.datatype.toLowerCase() === "bool" ? "boolean" : "number",
-          source: "plc",
+          origin: "plc",
           quality: "good",
         };
         // Publish to topic (for real-time subscribers)
@@ -211,12 +211,12 @@ async function main() {
       if (nc && kvPut) {
         const varId = tag.name.replace(".", "_");
         const message = {
-          projectId: PROJECT_ID,
+          moduleId: MODULE_ID,
           variableId: varId,
           value,
           lastUpdated: Date.now(),
           datatype: tag.datatype.toLowerCase() === "real" ? "number" : "boolean",
-          source: "plc",
+          origin: "plc",
           quality: "good",
         };
         const subject = `${NATS_TOPIC}.${varId}`;

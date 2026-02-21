@@ -1,7 +1,6 @@
 #!/bin/bash
 # Full stack MQTT test
 
-export PROJECT_ID=ethernetip-test
 export MQTT_BROKER_URL="mqtts://mqtt1.anywherescada.joyautomation.com:8883"
 export MQTT_USERNAME=sxyxbwk
 export MQTT_PASSWORD="7zAe8Dco1obDm27Jar6asSi576apft_Y"

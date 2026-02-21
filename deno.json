@@ -11,9 +11,10 @@
     "@nats-io/kv": "jsr:@nats-io/kv@3",
     "@std/assert": "jsr:@std/assert@1",
     "@std/path": "jsr:@std/path@1",
-    "@tentacle/nats-schema": "jsr:@joyautomation/tentacle-nats-schema@^0.0.1"
+    "@tentacle/nats-schema": "../tentacle-nats-schema/src/mod.ts"
   },
   "compilerOptions": {
     "strict": true
   }
 }
+  

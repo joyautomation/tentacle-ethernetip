@@ -1,21 +1,23 @@
 /**
- * PLC Scanner - handles polling loops for configured PLCs
+ * PLC Scanner - handles polling loops for EtherNet/IP devices
  *
- * Subscription-based model:
- * - Browse on demand (fills cache for UI discovery)
- * - Only polls tags that have active subscriptions
- * - Services subscribe/unsubscribe to tags via NATS
- * - MQTT-enabled tags are auto-subscribed
+ * Stateless, subscriber-driven model:
+ * - Starts with zero connections
+ * - Browse requests include { deviceId, host, port } — creates temporary connection
+ * - Subscribe requests include { deviceId, host, port, scanRate, tags, subscriberId }
+ *   → creates persistent connection on-demand, starts polling
+ * - Unsubscribe removes tags; when zero subscribers remain, connection is closed
  *
  * NATS topics:
- * - plc.browse.{projectId} - Trigger browse, returns available tags
- * - plc.variables.{projectId} - Returns cached variables from last browse
- * - plc.subscribe.{projectId} - Subscribe tags to polling
- * - plc.unsubscribe.{projectId} - Unsubscribe tags from polling
+ * - ethernetip.browse - Browse device tags (requires host/port)
+ * - ethernetip.variables - Returns discovered variables
+ * - ethernetip.subscribe - Subscribe tags with connection info
+ * - ethernetip.unsubscribe - Unsubscribe tags
+ * - ethernetip.data.{deviceId}.{variableId} - Published variable data
+ * - ethernetip.command.{variableId} - Write commands
  */
 
 import { type NatsConnection, type Subscription } from "@nats-io/transport-deno";
-import { jetstream } from "@nats-io/jetstream";
 import {
   createCip,
   destroyCip,
@@ -26,22 +28,21 @@ import {
   expandUdtMembers,
   getTemplateId,
   type Cip,
-  type BatchReadResult,
 } from "../ethernetip/mod.ts";
 import { decodeFloat32, decodeUint, encodeUint } from "../ethernetip/encode.ts";
 import { log } from "../utils/logger.ts";
-import type { PlcConfig, ConfigManager, ConfigChangeEvent } from "./config.ts";
-import type { MqttConfigManager } from "./mqttConfig.ts";
 import type { BrowsePhase, BrowseProgressMessage } from "@tentacle/nats-schema";
 import { NATS_TOPICS, substituteTopic } from "@tentacle/nats-schema";
+
+/** Module ID for this service */
+const MODULE_ID = "ethernetip";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Cached variable with tag info and last known value
- * This is stored in NATS KV and persists across restarts
+ * Discovered variable with tag info and last known value
  */
 type CachedVariable = {
   name: string;           // tag name / variableId
@@ -55,27 +56,29 @@ type CachedVariable = {
  * Variable info for request/reply (API response format)
  */
 type VariableInfo = {
+  moduleId: string;
   deviceId: string;
   variableId: string;
   value: number | boolean | string | null;
   datatype: string;
   quality: "good" | "bad" | "unknown";
-  source: string;
+  origin: string;
   lastUpdated: number;
 };
 
 type ConnectionState = "disconnected" | "connecting" | "connected";
 
 type PlcConnection = {
-  config: PlcConfig;
+  deviceId: string;
+  host: string;
+  port: number;
+  scanRate: number;
   cip: Cip | null;
-  /** All discovered variables (from browse) with their current values */
+  /** All discovered variables with their current values */
   variables: Map<string, CachedVariable>;
   polling: boolean;
   abortController: AbortController;
-  /** Flag to batch cache saves */
-  cacheModified: boolean;
-  /** Current connection state for observability */
+  /** Current connection state */
   connectionState: ConnectionState;
   /** Number of consecutive connection failures (for exponential backoff) */
   consecutiveFailures: number;
@@ -90,20 +93,44 @@ type PlcConnection = {
 };
 
 /**
- * Subscription request payload
+ * Subscribe request payload — includes connection info for on-demand connections
  */
 type SubscribeRequest = {
+  deviceId: string;
+  host: string;
+  port: number;
+  scanRate?: number;
   tags: string[];
   subscriberId: string;
 };
 
 /**
- * Browse request payload
+ * Unsubscribe request payload
+ */
+type UnsubscribeRequest = {
+  deviceId: string;
+  tags: string[];
+  subscriberId: string;
+};
+
+/**
+ * Browse request payload — includes connection info
  */
 type BrowseRequest = {
-  plcId?: string;  // Optional: browse specific PLC, or all if omitted
-  browseId?: string;  // Optional: unique ID for async browse with progress tracking
-  async?: boolean;  // Optional: if true, return immediately and publish progress
+  deviceId: string;
+  host: string;
+  port: number;
+  browseId?: string;
+  async?: boolean;
+};
+
+/**
+ * Per-subscriber tracking within a device
+ */
+type DeviceSubscription = {
+  subscriberId: string;
+  tags: Set<string>;
+  scanRate: number;
 };
 
 export type ScannerManager = {
@@ -123,21 +150,16 @@ const ATOMIC_TYPES = [
 ];
 
 /**
- * Create a scanner that manages polling loops for all configured PLCs
+ * Create a scanner that manages polling loops for EtherNet/IP devices.
+ * Starts with zero connections — devices are connected on-demand via subscribe/browse.
  */
 export async function createScanner(
   nc: NatsConnection,
-  projectId: string,
-  configManager: ConfigManager,
-  mqttConfigManager?: MqttConfigManager,
 ): Promise<ScannerManager> {
   const connections = new Map<string, PlcConnection>();
 
-  // Subscription tracking: variableId -> Set of subscriberIds
-  const subscriptions = new Map<string, Set<string>>();
-
-  // MQTT deadband tracking: variableId -> last published value and timestamp
-  const mqttLastPublish = new Map<string, { value: number | boolean | string | null, timestamp: number }>();
+  // Per-device subscriber tracking: deviceId → (subscriberId → DeviceSubscription)
+  const deviceSubscribers = new Map<string, Map<string, DeviceSubscription>>();
 
   // NATS subscriptions
   let variablesSub: Subscription | null = null;
@@ -146,16 +168,14 @@ export async function createScanner(
   let unsubscribeSub: Subscription | null = null;
   let writeSub: Subscription | null = null;
 
-  // NATS subjects
-  const dataSubject = `plc.data.${projectId}`;
-  const mqttDataSubjectBase = `plc.data.${projectId}`;
-  const variablesSubject = `plc.variables.${projectId}`;
-  const browseSubject = `plc.browse.${projectId}`;
-  const subscribeSubject = `plc.subscribe.${projectId}`;
-  const unsubscribeSubject = `plc.unsubscribe.${projectId}`;
-  // Write subject matches what tentacle-mqtt publishes for DCMD: ${projectId}/${variableId}
-  // Since NATS uses . as delimiter and variableId may contain dots, we subscribe broadly
-  const writeSubjectPrefix = `${projectId}/`;
+  // NATS subjects (module-namespaced)
+  const dataSubject = `${MODULE_ID}.data`;
+  const variablesSubject = `${MODULE_ID}.variables`;
+  const browseSubject = `${MODULE_ID}.browse`;
+  const subscribeSubject = `${MODULE_ID}.subscribe`;
+  const unsubscribeSubject = `${MODULE_ID}.unsubscribe`;
+  // Write command subject: ethernetip.command.>
+  const writeCommandSubject = `${MODULE_ID}.command.>`;
 
   /**
    * Sanitize variableId for use in NATS subject
@@ -176,145 +196,107 @@ export async function createScanner(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Subscription Management
+  // Per-Device Subscription Management
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Subscribe tags to be polled
+   * Get all subscribed tags for a specific device
    */
-  function subscribeTags(tags: string[], subscriberId: string): void {
-    let addedCount = 0;
-    for (const tag of tags) {
-      if (!subscriptions.has(tag)) {
-        subscriptions.set(tag, new Set());
-      }
-      const subscribers = subscriptions.get(tag)!;
-      if (!subscribers.has(subscriberId)) {
-        subscribers.add(subscriberId);
-        addedCount++;
+  function getDeviceSubscribedTags(deviceId: string): Set<string> {
+    const subs = deviceSubscribers.get(deviceId);
+    if (!subs) return new Set();
+    const tags = new Set<string>();
+    for (const sub of subs.values()) {
+      for (const tag of sub.tags) {
+        tags.add(tag);
       }
     }
-    if (addedCount > 0) {
-      log.eip.info(`Subscribed ${addedCount} tags for ${subscriberId}, total active: ${subscriptions.size}`);
-    }
+    return tags;
   }
 
   /**
-   * Unsubscribe tags from polling
+   * Get the effective scan rate for a device (fastest among subscribers)
    */
-  function unsubscribeTags(tags: string[], subscriberId: string): void {
-    let removedCount = 0;
-    for (const tag of tags) {
-      const subscribers = subscriptions.get(tag);
-      if (subscribers) {
-        if (subscribers.delete(subscriberId)) {
-          removedCount++;
-        }
-        // Remove tag entirely if no subscribers left
-        if (subscribers.size === 0) {
-          subscriptions.delete(tag);
-        }
+  function getDeviceScanRate(deviceId: string, defaultRate: number): number {
+    const subs = deviceSubscribers.get(deviceId);
+    if (!subs || subs.size === 0) return defaultRate;
+    let fastest = Infinity;
+    for (const sub of subs.values()) {
+      if (sub.scanRate < fastest) fastest = sub.scanRate;
+    }
+    return fastest === Infinity ? defaultRate : fastest;
+  }
+
+  /**
+   * Check if a device has any subscribers
+   */
+  function hasSubscribers(deviceId: string): boolean {
+    const subs = deviceSubscribers.get(deviceId);
+    return subs !== undefined && subs.size > 0;
+  }
+
+  /**
+   * Add a subscriber for a device
+   */
+  function addSubscriber(
+    deviceId: string,
+    subscriberId: string,
+    tags: string[],
+    scanRate: number,
+  ): void {
+    if (!deviceSubscribers.has(deviceId)) {
+      deviceSubscribers.set(deviceId, new Map());
+    }
+    const subs = deviceSubscribers.get(deviceId)!;
+    const existing = subs.get(subscriberId);
+    if (existing) {
+      // Merge tags and update scan rate
+      for (const tag of tags) {
+        existing.tags.add(tag);
       }
-    }
-    if (removedCount > 0) {
-      log.eip.info(`Unsubscribed ${removedCount} tags for ${subscriberId}, total active: ${subscriptions.size}`);
-    }
-  }
-
-  /**
-   * Get all tags that have active subscriptions
-   */
-  function getSubscribedTags(): Set<string> {
-    return new Set(subscriptions.keys());
-  }
-
-  /**
-   * Check if a tag is subscribed
-   */
-  function isSubscribed(tag: string): boolean {
-    const subscribers = subscriptions.get(tag);
-    return subscribers !== undefined && subscribers.size > 0;
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Tag Cache (NATS KV)
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const cacheStreamName = `KV_field-config-${projectId}`;
-  const cacheSubjectPrefix = `$KV.field-config-${projectId}`;
-  const js = jetstream(nc);
-  let jsm: Awaited<ReturnType<typeof js.jetstreamManager>> | null = null;
-
-  async function getJsm() {
-    if (!jsm) {
-      jsm = await js.jetstreamManager();
-    }
-    return jsm;
-  }
-
-  /**
-   * Load cached variables (with values) for a PLC from NATS KV
-   */
-  async function loadVariableCache(plcId: string): Promise<Map<string, CachedVariable>> {
-    const variables = new Map<string, CachedVariable>();
-    let corrected = false;
-    try {
-      const manager = await getJsm();
-      const msg = await manager.streams.getMessage(cacheStreamName, {
-        last_by_subj: `${cacheSubjectPrefix}.cache.variables.${plcId}`,
+      existing.scanRate = scanRate;
+    } else {
+      subs.set(subscriberId, {
+        subscriberId,
+        tags: new Set(tags),
+        scanRate,
       });
-      if (msg?.data && msg.data.length > 0) {
-        const cached = JSON.parse(new TextDecoder().decode(msg.data)) as CachedVariable[];
-        for (const v of cached) {
-          // Correct datatype based on actual value if there's a mismatch
-          // This fixes issues where UDT members were incorrectly typed during initial browse
-          if (v.value !== null && v.value !== undefined) {
-            if (typeof v.value === "number" && v.datatype === "BOOL") {
-              log.eip.info(`Correcting cached datatype for ${v.name}: BOOL -> REAL (value is number)`);
-              v.datatype = "REAL";
-              corrected = true;
-            } else if (typeof v.value === "boolean" && v.datatype !== "BOOL") {
-              log.eip.info(`Correcting cached datatype for ${v.name}: ${v.datatype} -> BOOL (value is boolean)`);
-              v.datatype = "BOOL";
-              corrected = true;
-            }
-          }
-          variables.set(v.name, v);
-        }
-        log.eip.info(`Loaded ${variables.size} cached variables for PLC ${plcId}`);
-
-        // Save corrected cache if any datatypes were fixed
-        if (corrected) {
-          saveVariableCache(plcId, variables).catch(err => {
-            log.eip.warn(`Failed to save corrected cache: ${err}`);
-          });
-        }
-      }
-    } catch {
-      log.eip.debug(`No variable cache found for PLC ${plcId}`);
     }
-    return variables;
+    log.eip.info(
+      `Subscribed ${tags.length} tags for ${subscriberId} on device ${deviceId}, ` +
+      `total subscribers: ${subs.size}`,
+    );
   }
 
   /**
-   * Save variables to NATS KV cache
+   * Remove a subscriber's tags for a device.
+   * Returns true if the device has zero subscribers remaining.
    */
-  async function saveVariableCache(plcId: string, variables: Map<string, CachedVariable>): Promise<void> {
-    const subject = `${cacheSubjectPrefix}.cache.variables.${plcId}`;
-    const validVariables = [...variables.values()].filter(v => !/_member\d+$/.test(v.name));
-    const payload = new TextEncoder().encode(JSON.stringify(validVariables));
-    nc.publish(subject, payload);
-    await nc.flush();
-    log.eip.info(`Saved ${validVariables.length} variables to cache for PLC ${plcId}`);
-  }
+  function removeSubscriber(
+    deviceId: string,
+    subscriberId: string,
+    tags: string[],
+  ): boolean {
+    const subs = deviceSubscribers.get(deviceId);
+    if (!subs) return true;
 
-  /**
-   * Delete variable cache for a PLC
-   */
-  function deleteVariableCache(plcId: string): void {
-    const subject = `${cacheSubjectPrefix}.cache.variables.${plcId}`;
-    nc.publish(subject, new Uint8Array(0));
-    log.eip.debug(`Cleared variable cache for PLC ${plcId}`);
+    const existing = subs.get(subscriberId);
+    if (existing) {
+      for (const tag of tags) {
+        existing.tags.delete(tag);
+      }
+      // Remove subscriber entirely if no tags left
+      if (existing.tags.size === 0) {
+        subs.delete(subscriberId);
+      }
+    }
+
+    // Clean up device entry if no subscribers
+    if (subs.size === 0) {
+      deviceSubscribers.delete(deviceId);
+      return true;
+    }
+    return false;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -512,7 +494,7 @@ export async function createScanner(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Publishing (pub/sub only, no KV)
+  // Publishing (pub/sub only)
   // ─────────────────────────────────────────────────────────────────────────
 
   function publishValue(
@@ -532,7 +514,6 @@ export async function createScanner(
       const cached = conn.variables.get(variableId);
       if (cached) {
         cached.datatype = "REAL";
-        conn.cacheModified = true; // Save cache when datatype is corrected
       }
     } else if (typeof value === "boolean" && natsDatatype !== "boolean") {
       log.eip.debug(`Datatype mismatch for ${variableId}: cached=${datatype}, correcting to "boolean"`);
@@ -540,18 +521,16 @@ export async function createScanner(
       const cached = conn.variables.get(variableId);
       if (cached) {
         cached.datatype = "BOOL";
-        conn.cacheModified = true; // Save cache when datatype is corrected
       }
     }
 
-    // Update variable in memory (not persisted to cache on every update)
+    // Update variable in memory
     const existing = conn.variables.get(variableId);
     if (existing) {
       existing.value = value;
       existing.quality = quality;
       existing.lastUpdated = now;
     } else {
-      // New variable discovered during polling - this is unusual but save it
       conn.variables.set(variableId, {
         name: variableId,
         datatype,
@@ -559,12 +538,11 @@ export async function createScanner(
         quality,
         lastUpdated: now,
       });
-      conn.cacheModified = true;
     }
 
     const message = {
-      projectId,
-      deviceId: conn.config.id,
+      moduleId: MODULE_ID,
+      deviceId: conn.deviceId,
       variableId,
       value,
       timestamp: now,
@@ -573,56 +551,8 @@ export async function createScanner(
 
     const payload = new TextEncoder().encode(JSON.stringify(message));
 
-    // Publish to flat subject (internal use, tentacle-graphql)
-    nc.publish(dataSubject, payload);
-
-    // Publish to MQTT subject if enabled (with deadband filtering)
-    if (mqttConfigManager?.isEnabled(variableId)) {
-      const rawDeadband = mqttConfigManager.getDeadband(variableId);
-      const lastPublish = mqttLastPublish.get(variableId);
-
-      // Determine if we should publish based on deadband
-      let shouldPublish = false;
-
-      if (!lastPublish) {
-        // First publish for this variable - always publish
-        shouldPublish = true;
-      } else {
-        const timeSinceLastPublish = now - lastPublish.timestamp;
-
-        // Check maxTime (always publish if exceeded)
-        if (rawDeadband.maxTime && timeSinceLastPublish >= rawDeadband.maxTime) {
-          shouldPublish = true;
-        } else if (typeof value === "number" && typeof lastPublish.value === "number") {
-          // Numeric comparison: check if change exceeds deadband threshold
-          const change = Math.abs(value - lastPublish.value);
-          if (change > rawDeadband.value) {
-            shouldPublish = true;
-          }
-        } else if (typeof value === "boolean" || typeof value === "string") {
-          // Boolean/string: publish on any change (deadband.value doesn't apply)
-          if (value !== lastPublish.value) {
-            shouldPublish = true;
-          }
-        }
-      }
-
-      if (shouldPublish) {
-        const mqttSubject = `${mqttDataSubjectBase}.${sanitizeForSubject(variableId)}`;
-        const deadband = {
-          value: rawDeadband.value,
-          maxTime: rawDeadband.maxTime ? rawDeadband.maxTime / 1000 : undefined,
-        };
-        const mqttMessage = { ...message, deadband };
-        nc.publish(mqttSubject, new TextEncoder().encode(JSON.stringify(mqttMessage)));
-
-        // Update last publish tracking
-        mqttLastPublish.set(variableId, { value, timestamp: now });
-        log.eip.debug(`MQTT publish: ${variableId} = ${value} (deadband: ${rawDeadband.value})`);
-      } else {
-        log.eip.debug(`MQTT filtered: ${variableId} = ${value} (within deadband ${rawDeadband.value}, last=${lastPublish?.value})`);
-      }
-    }
+    // Publish to per-variable subject: ethernetip.data.{deviceId}.{variableId}
+    nc.publish(`${dataSubject}.${conn.deviceId}.${sanitizeForSubject(variableId)}`, payload);
   }
 
   /**
@@ -640,13 +570,6 @@ export async function createScanner(
       variableId: string;
       value: number | boolean | string;
       datatype: string;
-      deadband?: { value: number; maxTime?: number };
-    }> = [];
-    const mqttBatchMessages: Array<{
-      variableId: string;
-      value: number | boolean | string;
-      datatype: string;
-      deadband: { value: number; maxTime?: number };
     }> = [];
 
     for (const { variableId, value, datatype } of values) {
@@ -658,14 +581,12 @@ export async function createScanner(
         const cached = conn.variables.get(variableId);
         if (cached) {
           cached.datatype = "REAL";
-          conn.cacheModified = true;
         }
       } else if (typeof value === "boolean" && natsDatatype !== "boolean") {
         natsDatatype = "boolean";
         const cached = conn.variables.get(variableId);
         if (cached) {
           cached.datatype = "BOOL";
-          conn.cacheModified = true;
         }
       }
 
@@ -677,70 +598,19 @@ export async function createScanner(
         existing.lastUpdated = now;
       }
 
-      // Add to batch for internal subject
       batchMessages.push({ variableId, value, datatype: natsDatatype });
-
-      // Check MQTT publishing with deadband filtering
-      if (mqttConfigManager?.isEnabled(variableId)) {
-        const rawDeadband = mqttConfigManager.getDeadband(variableId);
-        const lastPublish = mqttLastPublish.get(variableId);
-
-        let shouldPublish = false;
-
-        if (!lastPublish) {
-          shouldPublish = true;
-        } else {
-          const timeSinceLastPublish = now - lastPublish.timestamp;
-
-          if (rawDeadband.maxTime && timeSinceLastPublish >= rawDeadband.maxTime) {
-            shouldPublish = true;
-          } else if (typeof value === "number" && typeof lastPublish.value === "number") {
-            const change = Math.abs(value - lastPublish.value);
-            if (change > rawDeadband.value) {
-              shouldPublish = true;
-            }
-          } else if (typeof value === "boolean" || typeof value === "string") {
-            if (value !== lastPublish.value) {
-              shouldPublish = true;
-            }
-          }
-        }
-
-        if (shouldPublish) {
-          const deadband = {
-            value: rawDeadband.value,
-            maxTime: rawDeadband.maxTime ? rawDeadband.maxTime / 1000 : undefined,
-          };
-          mqttBatchMessages.push({ variableId, value, datatype: natsDatatype, deadband });
-          mqttLastPublish.set(variableId, { value, timestamp: now });
-        }
-      }
     }
 
-    // Publish batch to internal subject (single message with all values)
+    // Publish batch to subject: ethernetip.data.{deviceId}
     const batchPayload = {
-      projectId,
-      deviceId: conn.config.id,
+      moduleId: MODULE_ID,
+      deviceId: conn.deviceId,
       timestamp: now,
       values: batchMessages,
     };
-    nc.publish(dataSubject, new TextEncoder().encode(JSON.stringify(batchPayload)));
+    nc.publish(`${dataSubject}.${conn.deviceId}`, new TextEncoder().encode(JSON.stringify(batchPayload)));
 
-    // Publish MQTT batch if any values passed deadband filtering
-    if (mqttBatchMessages.length > 0) {
-      const mqttBatchPayload = {
-        projectId,
-        deviceId: conn.config.id,
-        timestamp: now,
-        values: mqttBatchMessages,
-      };
-      // Use a batch subject for MQTT
-      const mqttBatchSubject = `${mqttDataSubjectBase}.batch`;
-      nc.publish(mqttBatchSubject, new TextEncoder().encode(JSON.stringify(mqttBatchPayload)));
-      log.eip.debug(`MQTT batch publish: ${mqttBatchMessages.length} values`);
-    }
-
-    log.eip.debug(`Batch published ${batchMessages.length} values (${mqttBatchMessages.length} to MQTT)`);
+    log.eip.debug(`Batch published ${batchMessages.length} values`);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -761,7 +631,7 @@ export async function createScanner(
   ): void {
     const progressMessage: BrowseProgressMessage = {
       browseId,
-      projectId,
+      moduleId: MODULE_ID,
       deviceId,
       phase,
       totalTags,
@@ -770,55 +640,55 @@ export async function createScanner(
       message,
       timestamp: Date.now(),
     };
-    const subject = substituteTopic(NATS_TOPICS.plc.browseProgress, { browseId });
+    const subject = substituteTopic(NATS_TOPICS.ethernetip.browseProgress, { browseId });
     nc.publish(subject, new TextEncoder().encode(JSON.stringify(progressMessage)));
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Browse Handler (on-demand)
+  // Browse Handler (on-demand, creates temporary connection)
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Browse tags from PLC and update cache
-   * Does NOT start polling - just discovers available tags
-   * If browseId is provided, publishes progress updates to NATS
+   * Browse tags from a PLC device.
+   * Creates a temporary connection if one doesn't already exist for this device.
+   * If browseId is provided, publishes progress updates to NATS.
    */
-  async function browseAndCacheTags(plcId: string, browseId?: string): Promise<VariableInfo[]> {
-    const conn = connections.get(plcId);
-    if (!conn) {
-      log.eip.warn(`Browse requested for unknown PLC: ${plcId}`);
-      if (browseId) {
-        publishBrowseProgress(browseId, plcId, "failed", 0, 0, 1, `Unknown PLC: ${plcId}`);
-      }
-      return [];
-    }
+  async function browseDevice(
+    deviceId: string,
+    host: string,
+    port: number,
+    browseId?: string,
+  ): Promise<VariableInfo[]> {
+    // Reuse existing connection if available, otherwise create temporary one
+    let conn = connections.get(deviceId);
+    let tempCip: Cip | null = null;
+    let cip: Cip;
 
-    // Ensure connected
-    if (!conn.cip) {
+    if (conn?.cip) {
+      cip = conn.cip;
+    } else {
       try {
-        log.eip.info(`Connecting to PLC ${plcId} for browse...`);
+        log.eip.info(`Connecting to ${deviceId} (${host}:${port}) for browse...`);
         if (browseId) {
-          publishBrowseProgress(browseId, plcId, "discovering", 0, 0, 0, "Connecting to PLC...");
+          publishBrowseProgress(browseId, deviceId, "discovering", 0, 0, 0, "Connecting to PLC...");
         }
-        conn.cip = await createCip({
-          host: conn.config.host,
-          port: conn.config.port,
-        });
-        log.eip.info(`Connected to PLC ${plcId}: ${conn.cip.identity?.productName || "Unknown"}`);
+        tempCip = await createCip({ host, port });
+        cip = tempCip;
+        log.eip.info(`Connected to ${deviceId}: ${cip.identity?.productName || "Unknown"}`);
       } catch (err) {
-        log.eip.error(`Failed to connect to PLC ${plcId} for browse: ${err}`);
+        log.eip.error(`Failed to connect to ${deviceId} for browse: ${err}`);
         if (browseId) {
-          publishBrowseProgress(browseId, plcId, "failed", 0, 0, 1, `Connection failed: ${err}`);
+          publishBrowseProgress(browseId, deviceId, "failed", 0, 0, 1, `Connection failed: ${err}`);
         }
         return [];
       }
     }
 
-    log.eip.info(`Browsing tags for PLC ${plcId}...`);
+    log.eip.info(`Browsing tags for ${deviceId}...`);
     if (browseId) {
-      publishBrowseProgress(browseId, plcId, "discovering", 0, 0, 0, "Discovering tags from PLC...");
+      publishBrowseProgress(browseId, deviceId, "discovering", 0, 0, 0, "Discovering tags from PLC...");
     }
-    const allTags = await browseTags(conn.cip);
+    const allTags = await browseTags(cip);
 
     const atomicTags = allTags.filter(
       (t) => ATOMIC_TYPES.includes(t.datatype) && !t.isArray,
@@ -840,7 +710,7 @@ export async function createScanner(
     if (structTags.length > 0) {
       log.eip.info(`Expanding ${structTags.length} struct tags...`);
       if (browseId) {
-        publishBrowseProgress(browseId, plcId, "expanding", structTags.length, 0, 0, `Expanding ${structTags.length} struct tags...`);
+        publishBrowseProgress(browseId, deviceId, "expanding", structTags.length, 0, 0, `Expanding ${structTags.length} struct tags...`);
       }
       let expandedCount = 0;
       let structsProcessed = 0;
@@ -850,7 +720,7 @@ export async function createScanner(
           const templateId = getTemplateId(structTag.symbolType);
           if (templateId === null) continue;
 
-          const members = await expandUdtMembers(conn.cip!, structTag.name, templateId);
+          const members = await expandUdtMembers(cip, structTag.name, templateId);
           for (const member of members) {
             if (isValidTagName(member.path)) {
               discoveredTags.set(member.path, member.datatype);
@@ -863,61 +733,42 @@ export async function createScanner(
         structsProcessed++;
         // Publish progress every 10 struct tags
         if (browseId && structsProcessed % 10 === 0) {
-          publishBrowseProgress(browseId, plcId, "expanding", structTags.length, structsProcessed, 0, `Expanded ${structsProcessed}/${structTags.length} structs (${expandedCount} members)`);
+          publishBrowseProgress(browseId, deviceId, "expanding", structTags.length, structsProcessed, 0, `Expanded ${structsProcessed}/${structTags.length} structs (${expandedCount} members)`);
         }
       }
 
       log.eip.info(`UDT expansion complete: ${expandedCount} members, total ${discoveredTags.size} tags`);
     }
 
-    // Update cache with discovered tags (preserve existing values AND corrected datatypes)
+    // Build variables map from discovered tags
+    const variables = new Map<string, CachedVariable>();
     for (const [name, datatype] of discoveredTags) {
-      if (!conn.variables.has(name)) {
-        conn.variables.set(name, {
-          name,
-          datatype,
-          value: null,
-          quality: "unknown",
-          lastUpdated: 0,
-        });
-      } else {
-        const existing = conn.variables.get(name)!;
-        // Only update datatype from template if the existing variable has never been read successfully.
-        // If value is not null, the datatype may have been corrected based on actual PLC response,
-        // which is more reliable than template parsing. Template parsing can have alignment issues
-        // that cause wrong datatypes, but actual PLC reads always return the correct type code.
-        if (existing.value === null && existing.datatype !== datatype) {
-          log.eip.debug(`Updating datatype for unread variable ${name}: ${existing.datatype} -> ${datatype}`);
-          existing.datatype = datatype;
-        } else if (existing.value !== null && existing.datatype !== datatype) {
-          log.eip.debug(`Preserving corrected datatype for ${name}: keeping ${existing.datatype} (template says ${datatype})`);
-        }
-      }
+      variables.set(name, {
+        name,
+        datatype,
+        value: null,
+        quality: "unknown",
+        lastUpdated: 0,
+      });
     }
 
-    // Remove stale variables
-    const staleKeys = [...conn.variables.keys()].filter(k => !discoveredTags.has(k));
-    for (const key of staleKeys) {
-      conn.variables.delete(key);
-    }
-
-    // Read values for all discovered tags once (so UI shows actual values instead of null/unknown)
-    const variablesToRead = [...conn.variables.values()].filter(v => v.value === null);
+    // Read values for all discovered tags once
+    const variablesToRead = [...variables.values()];
     if (variablesToRead.length > 0) {
       log.eip.info(`Reading initial values for ${variablesToRead.length} tags...`);
       if (browseId) {
-        publishBrowseProgress(browseId, plcId, "reading", variablesToRead.length, 0, 0, `Reading values for ${variablesToRead.length} tags...`);
+        publishBrowseProgress(browseId, deviceId, "reading", variablesToRead.length, 0, 0, `Reading values for ${variablesToRead.length} tags...`);
       }
       let readCount = 0;
       let failCount = 0;
 
       for (const variable of variablesToRead) {
         try {
-          const response = await readTag(conn.cip!, variable.name);
+          const response = await readTag(cip, variable.name);
           if (response.success) {
             const { value, typeCode } = decodeTagValue(response.data, variable.datatype);
 
-            // Correct cached datatype based on actual PLC response
+            // Correct datatype based on actual PLC response
             const actualDatatype = typeCodeToDatatype(typeCode);
             if (actualDatatype && actualDatatype !== variable.datatype) {
               log.eip.debug(`Correcting datatype for ${variable.name}: ${variable.datatype} -> ${actualDatatype}`);
@@ -940,7 +791,7 @@ export async function createScanner(
         const totalProcessed = readCount + failCount;
         // Publish progress every 50 tags for smooth UI updates
         if (browseId && totalProcessed % 50 === 0) {
-          publishBrowseProgress(browseId, plcId, "reading", variablesToRead.length, totalProcessed, failCount, `Read ${totalProcessed}/${variablesToRead.length} tags`);
+          publishBrowseProgress(browseId, deviceId, "reading", variablesToRead.length, totalProcessed, failCount, `Read ${totalProcessed}/${variablesToRead.length} tags`);
         }
         // Log progress every 100 tags
         if (totalProcessed % 100 === 0) {
@@ -951,21 +802,24 @@ export async function createScanner(
       log.eip.info(`Initial value read complete: ${readCount} success, ${failCount} failed`);
     }
 
-    if (browseId) {
-      publishBrowseProgress(browseId, plcId, "caching", conn.variables.size, 0, 0, "Saving to cache...");
+    // Clean up temporary connection (don't close if we were reusing an existing one)
+    if (tempCip) {
+      try {
+        await destroyCip(tempCip);
+      } catch {
+        // Ignore disconnect errors
+      }
     }
 
-    await saveVariableCache(plcId, conn.variables);
-
-    log.eip.info(`Browse complete: ${conn.variables.size} tags cached for PLC ${plcId}`);
+    log.eip.info(`Browse complete: ${variables.size} tags for device ${deviceId}`);
 
     // Publish completion
     if (browseId) {
-      publishBrowseProgress(browseId, plcId, "completed", conn.variables.size, conn.variables.size, 0, `Browse complete: ${conn.variables.size} tags`);
+      publishBrowseProgress(browseId, deviceId, "completed", variables.size, variables.size, 0, `Browse complete: ${variables.size} tags`);
     }
 
     // Return as VariableInfo array
-    return [...conn.variables.values()]
+    return [...variables.values()]
       .filter(v => isValidTagName(v.name))
       .map(v => {
         // Infer correct datatype from actual value (same failsafe as publishValue)
@@ -976,19 +830,20 @@ export async function createScanner(
           datatype = "boolean";
         }
         return {
-          deviceId: plcId,
+          moduleId: MODULE_ID,
+          deviceId,
           variableId: v.name,
           value: v.value,
           datatype,
           quality: v.quality,
-          source: "plc",
+          origin: "plc",
           lastUpdated: v.lastUpdated,
         };
       });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Write Handler (from MQTT DCMD via tentacle-mqtt)
+  // Write Handler
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
@@ -1005,15 +860,16 @@ export async function createScanner(
 
   /**
    * Handle write request from MQTT DCMD
-   * Subject format: ${projectId}/${variableId}
+   * Subject format: ethernetip.command.{variableId}
    * Payload: string value
    */
   async function handleWriteCommand(subject: string, data: Uint8Array): Promise<void> {
-    // Extract variableId from subject
-    if (!subject.startsWith(writeSubjectPrefix)) {
+    // Extract variableId from subject: ethernetip.command.{variableId}
+    const commandPrefix = `${MODULE_ID}.command.`;
+    if (!subject.startsWith(commandPrefix)) {
       return;
     }
-    const variableId = subject.slice(writeSubjectPrefix.length);
+    const variableId = subject.slice(commandPrefix.length);
     if (!variableId) {
       log.eip.warn(`Write command with empty variableId: ${subject}`);
       return;
@@ -1026,20 +882,20 @@ export async function createScanner(
     // Find which PLC has this variable
     const conn = findPlcWithVariable(variableId);
     if (!conn) {
-      log.eip.warn(`Write failed: variable "${variableId}" not found in any PLC cache`);
+      log.eip.warn(`Write failed: variable "${variableId}" not found in any PLC`);
       return;
     }
 
     // Get variable info for datatype
     const variable = conn.variables.get(variableId);
     if (!variable) {
-      log.eip.warn(`Write failed: variable "${variableId}" not in cache`);
+      log.eip.warn(`Write failed: variable "${variableId}" not found`);
       return;
     }
 
     // Ensure PLC is connected
     if (!conn.cip) {
-      log.eip.warn(`Write failed: PLC ${conn.config.id} not connected`);
+      log.eip.warn(`Write failed: PLC ${conn.deviceId} not connected`);
       return;
     }
 
@@ -1082,7 +938,7 @@ export async function createScanner(
   function getAllVariables(): VariableInfo[] {
     const allVariables: VariableInfo[] = [];
 
-    for (const [plcId, conn] of connections.entries()) {
+    for (const [deviceId, conn] of connections.entries()) {
       for (const cached of conn.variables.values()) {
         if (/_member\d+$/.test(cached.name)) continue;
         if (!/^[\x20-\x7E]+$/.test(cached.name)) continue;
@@ -1096,18 +952,73 @@ export async function createScanner(
         }
 
         allVariables.push({
-          deviceId: plcId,
+          moduleId: MODULE_ID,
+          deviceId,
           variableId: cached.name,
           value: cached.value,
           datatype,
           quality: cached.quality,
-          source: "plc",
+          origin: "plc",
           lastUpdated: cached.lastUpdated,
         });
       }
     }
 
     return allVariables;
+  }
+
+  /**
+   * Create a new PlcConnection for a device (on-demand)
+   */
+  function createConnection(
+    deviceId: string,
+    host: string,
+    port: number,
+    scanRate: number,
+  ): PlcConnection {
+    const conn: PlcConnection = {
+      deviceId,
+      host,
+      port,
+      scanRate,
+      cip: null,
+      variables: new Map(),
+      polling: false,
+      abortController: new AbortController(),
+      connectionState: "disconnected",
+      consecutiveFailures: 0,
+      lastSuccessfulRead: 0,
+      lastConnectAttempt: 0,
+      totalReads: 0,
+      totalFailures: 0,
+    };
+    connections.set(deviceId, conn);
+    log.eip.info(`Created connection entry for ${deviceId} (${host}:${port})`);
+    return conn;
+  }
+
+  /**
+   * Remove a connection and clean up
+   */
+  async function removeConnection(deviceId: string): Promise<void> {
+    const conn = connections.get(deviceId);
+    if (!conn) return;
+
+    // Stop polling
+    conn.abortController.abort();
+
+    // Disconnect
+    if (conn.cip) {
+      try {
+        await destroyCip(conn.cip);
+      } catch {
+        // Ignore disconnect errors
+      }
+      conn.cip = null;
+    }
+
+    connections.delete(deviceId);
+    log.eip.info(`Removed connection for ${deviceId}`);
   }
 
   async function startRequestHandlers(): Promise<void> {
@@ -1119,7 +1030,7 @@ export async function createScanner(
       for await (const msg of variablesSub!) {
         try {
           const variables = getAllVariables();
-          log.eip.info(`Variables request: returning ${variables.length} cached variables`);
+          log.eip.info(`Variables request: returning ${variables.length} variables`);
           msg.respond(new TextEncoder().encode(JSON.stringify(variables)));
         } catch (err) {
           log.eip.error(`Error handling variables request: ${err}`);
@@ -1128,61 +1039,49 @@ export async function createScanner(
       }
     })();
 
-    // Browse request handler (on-demand discovery)
+    // Browse request handler (on-demand discovery with connection info)
     browseSub = nc.subscribe(browseSubject);
     log.eip.info(`Listening for browse requests on ${browseSubject}`);
 
     (async () => {
       for await (const msg of browseSub!) {
         try {
-          let request: BrowseRequest = {};
+          let request: BrowseRequest | Record<string, unknown> = {};
           if (msg.data && msg.data.length > 0) {
             request = JSON.parse(new TextDecoder().decode(msg.data));
           }
 
+          const browseReq = request as BrowseRequest;
+          if (!browseReq.deviceId || !browseReq.host || !browseReq.port) {
+            msg.respond(new TextEncoder().encode(JSON.stringify({
+              error: "Browse requires deviceId, host, and port",
+            })));
+            continue;
+          }
+
           // Generate browseId if async mode or if one was provided
-          const browseId = request.browseId || (request.async ? crypto.randomUUID() : undefined);
+          const browseId = browseReq.browseId || (browseReq.async ? crypto.randomUUID() : undefined);
 
           // Async mode: return immediately with browseId, run browse in background
-          if (request.async && browseId) {
-            log.eip.info(`Browse request (async): starting browse with ID ${browseId}`);
+          if (browseReq.async && browseId) {
+            log.eip.info(`Browse request (async): ${browseReq.deviceId} at ${browseReq.host}:${browseReq.port}, ID ${browseId}`);
             msg.respond(new TextEncoder().encode(JSON.stringify({ browseId })));
 
             // Run browse in background
             (async () => {
               try {
-                if (request.plcId) {
-                  await browseAndCacheTags(request.plcId, browseId);
-                } else {
-                  for (const plcId of connections.keys()) {
-                    await browseAndCacheTags(plcId, browseId);
-                  }
-                }
+                const results = await browseDevice(browseReq.deviceId, browseReq.host, browseReq.port, browseId);
+                publishBrowseProgress(browseId, "_all", "completed", results.length, results.length, 0, `Browse complete: ${results.length} total tags`);
               } catch (err) {
                 log.eip.error(`Async browse failed: ${err}`);
-                if (browseId) {
-                  publishBrowseProgress(browseId, request.plcId || "all", "failed", 0, 0, 1, `Browse failed: ${err}`);
-                }
+                publishBrowseProgress(browseId, browseReq.deviceId, "failed", 0, 0, 1, `Browse failed: ${err}`);
               }
             })();
             continue;
           }
 
           // Sync mode: wait for browse to complete and return results
-          const results: VariableInfo[] = [];
-
-          if (request.plcId) {
-            // Browse specific PLC
-            const plcResults = await browseAndCacheTags(request.plcId, browseId);
-            results.push(...plcResults);
-          } else {
-            // Browse all PLCs
-            for (const plcId of connections.keys()) {
-              const plcResults = await browseAndCacheTags(plcId, browseId);
-              results.push(...plcResults);
-            }
-          }
-
+          const results = await browseDevice(browseReq.deviceId, browseReq.host, browseReq.port, browseId);
           log.eip.info(`Browse request: returning ${results.length} tags`);
           msg.respond(new TextEncoder().encode(JSON.stringify(results)));
         } catch (err) {
@@ -1192,7 +1091,7 @@ export async function createScanner(
       }
     })();
 
-    // Subscribe request handler
+    // Subscribe request handler (on-demand connection creation)
     subscribeSub = nc.subscribe(subscribeSubject);
     log.eip.info(`Listening for subscribe requests on ${subscribeSubject}`);
 
@@ -1200,7 +1099,47 @@ export async function createScanner(
       for await (const msg of subscribeSub!) {
         try {
           const request = JSON.parse(new TextDecoder().decode(msg.data)) as SubscribeRequest;
-          subscribeTags(request.tags, request.subscriberId);
+
+          if (!request.deviceId || !request.host || !request.port || !request.tags || !request.subscriberId) {
+            msg.respond(new TextEncoder().encode(JSON.stringify({
+              success: false,
+              error: "Subscribe requires deviceId, host, port, tags, and subscriberId",
+            })));
+            continue;
+          }
+
+          const scanRate = request.scanRate ?? 1000;
+
+          // Track subscriber
+          addSubscriber(request.deviceId, request.subscriberId, request.tags, scanRate);
+
+          // Create connection if it doesn't exist
+          let conn = connections.get(request.deviceId);
+          if (!conn) {
+            conn = createConnection(request.deviceId, request.host, request.port, scanRate);
+          }
+
+          // Update scan rate to fastest among subscribers
+          conn.scanRate = getDeviceScanRate(request.deviceId, scanRate);
+
+          // Populate variables map from subscribe tags so polling knows what to read
+          for (const tag of request.tags) {
+            if (!conn.variables.has(tag)) {
+              conn.variables.set(tag, {
+                name: tag,
+                datatype: "REAL", // Default — will be corrected on first read via typeCode
+                value: null,
+                quality: "unknown",
+                lastUpdated: 0,
+              });
+            }
+          }
+
+          // Start polling if not already running
+          if (!conn.polling) {
+            pollPlc(request.deviceId);
+          }
+
           msg.respond(new TextEncoder().encode(JSON.stringify({ success: true, count: request.tags.length })));
         } catch (err) {
           log.eip.error(`Error handling subscribe request: ${err}`);
@@ -1209,15 +1148,32 @@ export async function createScanner(
       }
     })();
 
-    // Unsubscribe request handler
+    // Unsubscribe request handler (connection cleanup when zero subscribers)
     unsubscribeSub = nc.subscribe(unsubscribeSubject);
     log.eip.info(`Listening for unsubscribe requests on ${unsubscribeSubject}`);
 
     (async () => {
       for await (const msg of unsubscribeSub!) {
         try {
-          const request = JSON.parse(new TextDecoder().decode(msg.data)) as SubscribeRequest;
-          unsubscribeTags(request.tags, request.subscriberId);
+          const request = JSON.parse(new TextDecoder().decode(msg.data)) as UnsubscribeRequest;
+
+          const zeroSubscribers = removeSubscriber(
+            request.deviceId,
+            request.subscriberId,
+            request.tags,
+          );
+
+          if (zeroSubscribers) {
+            log.eip.info(`No subscribers remaining for ${request.deviceId}, closing connection`);
+            await removeConnection(request.deviceId);
+          } else {
+            // Update scan rate (fastest remaining subscriber)
+            const conn = connections.get(request.deviceId);
+            if (conn) {
+              conn.scanRate = getDeviceScanRate(request.deviceId, conn.scanRate);
+            }
+          }
+
           msg.respond(new TextEncoder().encode(JSON.stringify({ success: true, count: request.tags.length })));
         } catch (err) {
           log.eip.error(`Error handling unsubscribe request: ${err}`);
@@ -1226,20 +1182,16 @@ export async function createScanner(
       }
     })();
 
-    // Write command handler (from tentacle-mqtt DCMD)
-    // Subscribe to all subjects and filter for ${projectId}/* pattern
-    // This is necessary because NATS wildcards can't match the ${projectId}/${variableId} format
-    writeSub = nc.subscribe(">");
-    log.eip.info(`Listening for write commands on ${writeSubjectPrefix}*`);
+    // Write command handler
+    // Subscribe to ethernetip.command.> for targeted write commands
+    writeSub = nc.subscribe(writeCommandSubject);
+    log.eip.info(`Listening for write commands on ${writeCommandSubject}`);
 
     (async () => {
       for await (const msg of writeSub!) {
-        // Filter for our projectId
-        if (msg.subject.startsWith(writeSubjectPrefix)) {
-          handleWriteCommand(msg.subject, msg.data).catch((err) => {
-            log.eip.error(`Error handling write command: ${err}`);
-          });
-        }
+        handleWriteCommand(msg.subject, msg.data).catch((err) => {
+          log.eip.error(`Error handling write command: ${err}`);
+        });
       }
     })();
   }
@@ -1256,8 +1208,8 @@ export async function createScanner(
     return delay;
   }
 
-  async function connectPlc(plcId: string): Promise<boolean> {
-    const conn = connections.get(plcId);
+  async function connectPlc(deviceId: string): Promise<boolean> {
+    const conn = connections.get(deviceId);
     if (!conn) return false;
     if (conn.cip) return true;
 
@@ -1265,10 +1217,10 @@ export async function createScanner(
     conn.lastConnectAttempt = Date.now();
 
     try {
-      log.eip.info(`[${plcId}] Connecting to ${conn.config.host}:${conn.config.port}...`);
+      log.eip.info(`[${deviceId}] Connecting to ${conn.host}:${conn.port}...`);
       conn.cip = await createCip({
-        host: conn.config.host,
-        port: conn.config.port,
+        host: conn.host,
+        port: conn.port,
       });
 
       // Success - reset failure count and update state
@@ -1276,7 +1228,7 @@ export async function createScanner(
       conn.consecutiveFailures = 0;
       conn.totalReads = 0;
       conn.totalFailures = 0;
-      log.eip.info(`[${plcId}] Connected to ${conn.cip.identity?.productName || "Unknown"}`);
+      log.eip.info(`[${deviceId}] Connected to ${conn.cip.identity?.productName || "Unknown"}`);
       return true;
     } catch (err) {
       conn.connectionState = "disconnected";
@@ -1284,18 +1236,18 @@ export async function createScanner(
       conn.cip = null;
 
       const backoff = getBackoffDelay(conn.consecutiveFailures);
-      log.eip.warn(`[${plcId}] Connection failed (attempt ${conn.consecutiveFailures}): ${err}`);
-      log.eip.info(`[${plcId}] Will retry in ${(backoff / 1000).toFixed(1)}s`);
+      log.eip.warn(`[${deviceId}] Connection failed (attempt ${conn.consecutiveFailures}): ${err}`);
+      log.eip.info(`[${deviceId}] Will retry in ${(backoff / 1000).toFixed(1)}s`);
       return false;
     }
   }
 
-  async function disconnectPlc(plcId: string): Promise<void> {
-    const conn = connections.get(plcId);
+  async function disconnectPlc(deviceId: string): Promise<void> {
+    const conn = connections.get(deviceId);
     if (!conn) return;
 
     if (conn.cip) {
-      log.eip.info(`[${plcId}] Disconnecting...`);
+      log.eip.info(`[${deviceId}] Disconnecting...`);
       try {
         await destroyCip(conn.cip);
       } catch {
@@ -1310,29 +1262,27 @@ export async function createScanner(
   // Polling Loop (only reads subscribed tags)
   // ─────────────────────────────────────────────────────────────────────────
 
-  async function pollPlc(plcId: string): Promise<void> {
-    const conn = connections.get(plcId);
-    if (!conn || !conn.config.enabled) return;
+  async function pollPlc(deviceId: string): Promise<void> {
+    const conn = connections.get(deviceId);
+    if (!conn) return;
 
     conn.polling = true;
-    log.eip.info(`[${plcId}] Starting polling loop (scan rate: ${conn.config.scanRate}ms)`);
+    log.eip.info(`[${deviceId}] Starting polling loop (scan rate: ${conn.scanRate}ms)`);
 
     // For periodic status logging
     let lastStatusLog = Date.now();
     const STATUS_LOG_INTERVAL = 30000; // Log status every 30 seconds
 
-    while (!conn.abortController.signal.aborted && conn.config.enabled) {
+    while (!conn.abortController.signal.aborted) {
       const startTime = Date.now();
 
-      // Get currently subscribed tags
-      const subscribedTags = getSubscribedTags();
+      // Get currently subscribed tags for this device
+      const subscribedTags = getDeviceSubscribedTags(deviceId);
 
       if (subscribedTags.size === 0) {
-        if (conn.connectionState === "connected") {
-          log.eip.info(`[${plcId}] No subscribed tags, waiting...`);
-        }
-        await sleep(1000, conn.abortController.signal);
-        continue;
+        // No subscribers — stop polling and close connection
+        log.eip.info(`[${deviceId}] No subscribed tags, stopping poll loop`);
+        break;
       }
 
       // Ensure connected (with exponential backoff on failures)
@@ -1347,18 +1297,18 @@ export async function createScanner(
           continue;
         }
 
-        const connected = await connectPlc(plcId);
+        const connected = await connectPlc(deviceId);
         if (!connected) {
           continue; // Backoff handled in connectPlc
         }
       }
 
-      // Read only subscribed variables that exist in this PLC's cache
+      // Read only subscribed variables that exist in this PLC's variables
       const variablesToRead = [...conn.variables.values()]
         .filter(v => subscribedTags.has(v.name));
 
       if (variablesToRead.length === 0) {
-        await sleep(conn.config.scanRate, conn.abortController.signal);
+        await sleep(conn.scanRate, conn.abortController.signal);
         continue;
       }
 
@@ -1390,9 +1340,8 @@ export async function createScanner(
             // Proactively correct cached datatype
             const actualDatatype = typeCodeToDatatype(typeCode);
             if (actualDatatype && actualDatatype !== variable.datatype) {
-              log.eip.debug(`[${plcId}] Correcting datatype for ${variable.name}: ${variable.datatype} -> ${actualDatatype}`);
+              log.eip.debug(`[${deviceId}] Correcting datatype for ${variable.name}: ${variable.datatype} -> ${actualDatatype}`);
               variable.datatype = actualDatatype;
-              conn.cacheModified = true;
             }
 
             // Collect sample values for logging (first 2 tags)
@@ -1406,7 +1355,7 @@ export async function createScanner(
           } else {
             failCount++;
             if (failCount <= 3) {
-              log.eip.debug(`[${plcId}] Read failed for "${variable.name}": status 0x${result.response.status.toString(16)}`);
+              log.eip.debug(`[${deviceId}] Read failed for "${variable.name}": status 0x${result.response.status.toString(16)}`);
             }
           }
         }
@@ -1421,9 +1370,9 @@ export async function createScanner(
         const errStr = String(err);
         if (errStr.includes("connection") || errStr.includes("socket") || errStr.includes("ECONNRESET") || errStr.includes("timeout")) {
           connectionError = true;
-          log.eip.warn(`[${plcId}] Connection error during batch read: ${err}`);
+          log.eip.warn(`[${deviceId}] Connection error during batch read: ${err}`);
         } else {
-          log.eip.warn(`[${plcId}] Batch read error: ${err}`);
+          log.eip.warn(`[${deviceId}] Batch read error: ${err}`);
           failCount = variablesToRead.length;
         }
       }
@@ -1434,12 +1383,12 @@ export async function createScanner(
 
       // Log first successful read (confirms data is flowing)
       if (wasFirstRead && readCount > 0) {
-        log.eip.info(`[${plcId}] Data flowing: ${sampleValues.join(", ")}${variablesToRead.length > 2 ? ` (+${variablesToRead.length - 2} more)` : ""}`);
+        log.eip.info(`[${deviceId}] Data flowing: ${sampleValues.join(", ")}${variablesToRead.length > 2 ? ` (+${variablesToRead.length - 2} more)` : ""}`);
       }
 
       // Handle connection errors - force reconnect
       if (connectionError) {
-        log.eip.warn(`[${plcId}] Lost connection, will reconnect...`);
+        log.eip.warn(`[${deviceId}] Lost connection, will reconnect...`);
         conn.cip = null;
         conn.connectionState = "disconnected";
         conn.consecutiveFailures++;
@@ -1450,27 +1399,19 @@ export async function createScanner(
       const now = Date.now();
       if (now - lastStatusLog >= STATUS_LOG_INTERVAL && readCount > 0) {
         const sampleStr = sampleValues.length > 0 ? ` [${sampleValues.join(", ")}]` : "";
-        log.eip.info(`[${plcId}] Polling ${variablesToRead.length} tags @ ${conn.config.scanRate}ms` +
+        log.eip.info(`[${deviceId}] Polling ${variablesToRead.length} tags @ ${conn.scanRate}ms` +
           ` (${conn.totalReads} reads, ${conn.totalFailures} failures)${sampleStr}`);
         lastStatusLog = now;
       }
 
       // Log summary at debug level
       if (readCount > 0 || failCount > 0) {
-        log.eip.debug(`[${plcId}] Poll: ${readCount}/${variablesToRead.length} success, ${failCount} failed`);
+        log.eip.debug(`[${deviceId}] Poll: ${readCount}/${variablesToRead.length} success, ${failCount} failed`);
       }
 
-      // Save cache if modified
-      if (conn.cacheModified) {
-        conn.cacheModified = false;
-        saveVariableCache(plcId, conn.variables).catch((err) => {
-          log.eip.warn(`Failed to save variable cache: ${err}`);
-        });
-      }
-
-      // Wait for next scan
+      // Wait for next scan (use current scan rate which may have been updated)
       const elapsed = Date.now() - startTime;
-      const delay = Math.max(0, conn.config.scanRate - elapsed);
+      const delay = Math.max(0, conn.scanRate - elapsed);
       if (delay > 0) {
         await sleep(delay, conn.abortController.signal);
       }
@@ -1478,7 +1419,7 @@ export async function createScanner(
 
     conn.polling = false;
     conn.connectionState = "disconnected";
-    log.eip.info(`[${plcId}] Polling stopped (total reads: ${conn.totalReads}, failures: ${conn.totalFailures})`);
+    log.eip.info(`[${deviceId}] Polling stopped (total reads: ${conn.totalReads}, failures: ${conn.totalFailures})`);
   }
 
   async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -1492,154 +1433,18 @@ export async function createScanner(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Connection Initialization
-  // ─────────────────────────────────────────────────────────────────────────
-
-  async function initConnection(plcId: string, config: PlcConfig): Promise<PlcConnection> {
-    const cachedVariables = await loadVariableCache(plcId);
-
-    const conn: PlcConnection = {
-      config,
-      cip: null,
-      variables: cachedVariables,
-      polling: false,
-      abortController: new AbortController(),
-      cacheModified: false,
-      connectionState: "disconnected",
-      consecutiveFailures: 0,
-      lastSuccessfulRead: 0,
-      lastConnectAttempt: 0,
-      totalReads: 0,
-      totalFailures: 0,
-    };
-
-    if (cachedVariables.size > 0) {
-      log.eip.info(`PLC ${plcId} initialized with ${cachedVariables.size} cached variables`);
-    }
-
-    return conn;
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // MQTT Auto-subscription
-  // ─────────────────────────────────────────────────────────────────────────
-
-  function autoSubscribeMqttTags(): void {
-    if (!mqttConfigManager) return;
-
-    const enabledTags = mqttConfigManager.getEnabledVariables();
-    if (enabledTags.length > 0) {
-      subscribeTags(enabledTags, "mqtt");
-      log.eip.info(`Auto-subscribed ${enabledTags.length} MQTT-enabled tags`);
-    }
-  }
-
-  /**
-   * Handle MQTT config changes - sync subscriptions with enabled tags
-   */
-  function handleMqttConfigChange(): void {
-    if (!mqttConfigManager) return;
-
-    const enabledTags = new Set(mqttConfigManager.getEnabledVariables());
-    const currentMqttTags = new Set<string>();
-
-    // Find all tags currently subscribed by "mqtt"
-    for (const [tag, subscribers] of subscriptions) {
-      if (subscribers.has("mqtt")) {
-        currentMqttTags.add(tag);
-      }
-    }
-
-    // Subscribe newly enabled tags
-    const toSubscribe = [...enabledTags].filter(tag => !currentMqttTags.has(tag));
-    if (toSubscribe.length > 0) {
-      subscribeTags(toSubscribe, "mqtt");
-    }
-
-    // Unsubscribe disabled tags
-    const toUnsubscribe = [...currentMqttTags].filter(tag => !enabledTags.has(tag));
-    if (toUnsubscribe.length > 0) {
-      unsubscribeTags(toUnsubscribe, "mqtt");
-    }
-
-    if (toSubscribe.length > 0 || toUnsubscribe.length > 0) {
-      log.eip.info(`MQTT subscriptions updated: +${toSubscribe.length} -${toUnsubscribe.length}, total: ${enabledTags.size}`);
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Config Change Handling
-  // ─────────────────────────────────────────────────────────────────────────
-
-  function handleConfigChange(event: ConfigChangeEvent): void {
-    const plcId = event.plcId;
-
-    if (event.type === "plc-added" || event.type === "plc-updated") {
-      const config = configManager.getPlc(plcId);
-      if (!config) return;
-
-      const existing = connections.get(plcId);
-      if (existing) {
-        const wasEnabled = existing.config.enabled;
-        existing.config = config;
-
-        if (!wasEnabled && config.enabled) {
-          pollPlc(plcId);
-        } else if (wasEnabled && !config.enabled) {
-          existing.abortController.abort();
-          existing.abortController = new AbortController();
-          disconnectPlc(plcId);
-        }
-      } else {
-        initConnection(plcId, config).then((conn) => {
-          connections.set(plcId, conn);
-          if (config.enabled) {
-            pollPlc(plcId);
-          }
-        });
-      }
-    } else if (event.type === "plc-removed") {
-      const conn = connections.get(plcId);
-      if (conn) {
-        conn.abortController.abort();
-        disconnectPlc(plcId);
-        deleteVariableCache(plcId);
-        connections.delete(plcId);
-      }
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
   // Public API
   // ─────────────────────────────────────────────────────────────────────────
 
   const manager: ScannerManager = {
     start() {
-      log.eip.info("Starting scanner (subscription-based polling)...");
-
-      // Subscribe to config changes
-      configManager.onChange(handleConfigChange);
-      mqttConfigManager?.onChange(handleMqttConfigChange);
+      log.eip.info("Starting scanner (stateless, subscriber-driven)...");
+      log.eip.info("Zero connections — devices will connect on subscribe/browse");
 
       // Start request handlers
       startRequestHandlers();
 
-      // Initialize connections for existing PLCs
-      (async () => {
-        for (const [plcId, plcConfig] of configManager.config.plcs) {
-          const conn = await initConnection(plcId, plcConfig);
-          connections.set(plcId, conn);
-
-          if (plcConfig.enabled) {
-            pollPlc(plcId);
-          }
-        }
-
-        // Auto-subscribe MQTT-enabled tags after connections are initialized
-        autoSubscribeMqttTags();
-
-        log.eip.info(`Scanner started with ${connections.size} PLCs, ${subscriptions.size} subscribed tags`);
-      })();
+      log.eip.info("Scanner started, waiting for subscribe/browse requests");
     },
 
     async stop() {
@@ -1652,14 +1457,14 @@ export async function createScanner(
       unsubscribeSub?.unsubscribe();
       writeSub?.unsubscribe();
 
-      // Stop all polling loops
-      for (const [plcId, conn] of connections) {
+      // Stop all polling loops and disconnect
+      for (const [deviceId, conn] of connections) {
         conn.abortController.abort();
-        await disconnectPlc(plcId);
+        await disconnectPlc(deviceId);
       }
 
       connections.clear();
-      subscriptions.clear();
+      deviceSubscribers.clear();
       log.eip.info("Scanner stopped");
     },
   };
