@@ -6,46 +6,23 @@ on:
       - 'v*.*.*'
 
 jobs:
-  compile:
-    strategy:
-      matrix:
-        target:
-          - { deno: x86_64-unknown-linux-gnu, platform: linux-amd64, runner: ubuntu-latest }
-          - { deno: aarch64-unknown-linux-gnu, platform: linux-arm64, runner: ubuntu-latest }
-          - { deno: x86_64-pc-windows-msvc, platform: windows-amd64, runner: ubuntu-latest }
-          - { deno: aarch64-apple-darwin, platform: darwin-arm64, runner: macos-14 }
-    runs-on: ${{ matrix.target.runner }}
+  package:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           path: tentacle-ethernetip
 
-      - uses: actions/checkout@v4
-        with:
-          repository: joyautomation/tentacle-nats-schema
-          path: tentacle-nats-schema
-
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
-      - name: Compile for ${{ matrix.target.platform }}
-        run: |
-          EXT=""
-          if [[ "${{ matrix.target.platform }}" == windows-* ]]; then EXT=".exe"; fi
-          cd tentacle-ethernetip
-          deno compile --allow-all \
-            --target ${{ matrix.target.deno }} \
-            --output ../dist/tentacle-ethernetip-${{ matrix.target.platform }}${EXT} \
-            main.ts
+      - name: Package source
+        run: tar czf tentacle-ethernetip-src.tar.gz tentacle-ethernetip/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tentacle-ethernetip-${{ matrix.target.platform }}
-          path: dist/tentacle-ethernetip-*
+          name: tentacle-ethernetip-src
+          path: tentacle-ethernetip-src.tar.gz
 
   release:
-    needs: compile
+    needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
