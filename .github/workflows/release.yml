@@ -14,7 +14,7 @@ jobs:
           path: tentacle-ethernetip
 
       - name: Package source
-        run: tar czf tentacle-ethernetip-src.tar.gz tentacle-ethernetip/
+        run: tar czf tentacle-ethernetip-src.tar.gz --exclude='.git' tentacle-ethernetip/
 
       - uses: actions/upload-artifact@v4
         with:
