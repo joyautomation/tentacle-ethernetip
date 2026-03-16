@@ -91,6 +91,7 @@ export {
   getTemplateId,
   clearTemplateCache,
   getTemplateCacheSize,
+  getCachedTemplates,
   ATOMIC_TYPES,
 } from "./template.ts";
 export type { Template, TemplateMember } from "./template.ts";

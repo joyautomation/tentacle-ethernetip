@@ -27,7 +27,11 @@ import {
   browseTags,
   expandUdtMembers,
   getTemplateId,
+  getCachedTemplates,
+  clearTemplateCache,
+  readTemplate,
   type Cip,
+  type Template,
 } from "../ethernetip/mod.ts";
 import { decodeFloat32, decodeUint, encodeUint } from "../ethernetip/encode.ts";
 import { log } from "../utils/logger.ts";
@@ -131,6 +135,35 @@ type DeviceSubscription = {
   subscriberId: string;
   tags: Set<string>;
   scanRate: number;
+};
+
+/**
+ * Serialized UDT member for browse response
+ */
+type UdtMemberExport = {
+  name: string;
+  datatype: string;       // "BOOL", "DINT", "REAL", etc. or "STRUCT"
+  udtType?: string;       // template name if this member is a nested struct
+  isArray: boolean;
+};
+
+/**
+ * Serialized UDT template for browse response
+ */
+type UdtExport = {
+  name: string;
+  members: UdtMemberExport[];
+};
+
+/**
+ * Browse result including UDT template definitions
+ */
+export type BrowseResult = {
+  variables: VariableInfo[];
+  /** UDT definitions keyed by template name */
+  udts: Record<string, UdtExport>;
+  /** Mapping of struct tag names to their UDT type name */
+  structTags: Record<string, string>;
 };
 
 export type ScannerManager = {
@@ -658,7 +691,7 @@ export async function createScanner(
     host: string,
     port: number,
     browseId?: string,
-  ): Promise<VariableInfo[]> {
+  ): Promise<BrowseResult> {
     // Reuse existing connection if available, otherwise create temporary one
     let conn = connections.get(deviceId);
     let tempCip: Cip | null = null;
@@ -680,9 +713,12 @@ export async function createScanner(
         if (browseId) {
           publishBrowseProgress(browseId, deviceId, "failed", 0, 0, 1, `Connection failed: ${err}`);
         }
-        return [];
+        return { variables: [], udts: {}, structTags: {} };
       }
     }
+
+    // Clear template cache before browse so we only get templates from this device
+    clearTemplateCache();
 
     log.eip.info(`Browsing tags for ${deviceId}...`);
     if (browseId) {
@@ -706,7 +742,8 @@ export async function createScanner(
       }
     }
 
-    // Expand struct tags
+    // Expand struct tags and track UDT mappings
+    const structTagToUdt = new Map<string, string>(); // tagName → UDT template name
     if (structTags.length > 0) {
       log.eip.info(`Expanding ${structTags.length} struct tags...`);
       if (browseId) {
@@ -719,6 +756,12 @@ export async function createScanner(
         try {
           const templateId = getTemplateId(structTag.symbolType);
           if (templateId === null) continue;
+
+          // Read the template to get the UDT name for this struct tag
+          const template = await readTemplate(cip, templateId);
+          if (template) {
+            structTagToUdt.set(structTag.name, template.name);
+          }
 
           const members = await expandUdtMembers(cip, structTag.name, templateId);
           for (const member of members) {
@@ -818,8 +861,36 @@ export async function createScanner(
       publishBrowseProgress(browseId, deviceId, "completed", variables.size, variables.size, 0, `Browse complete: ${variables.size} tags`);
     }
 
-    // Return as VariableInfo array
-    return [...variables.values()]
+    // Build UDT exports from cached templates
+    const udts: Record<string, UdtExport> = {};
+    const cachedTemplates = getCachedTemplates();
+    // Build a templateId → name lookup for resolving nested struct member types
+    const templateIdToName = new Map<number, string>();
+    for (const [tid, tmpl] of cachedTemplates) {
+      templateIdToName.set(tid, tmpl.name);
+    }
+    for (const [_tid, tmpl] of cachedTemplates) {
+      // Skip templates with no useful members or fallback names
+      if (tmpl.members.length === 0) continue;
+      udts[tmpl.name] = {
+        name: tmpl.name,
+        members: tmpl.members.map(m => ({
+          name: m.name,
+          datatype: m.datatype,
+          udtType: m.isStruct && m.templateId ? templateIdToName.get(m.templateId) : undefined,
+          isArray: m.isArray,
+        })),
+      };
+    }
+
+    // Build structTags mapping
+    const structTagMapping: Record<string, string> = {};
+    for (const [tagName, udtName] of structTagToUdt) {
+      structTagMapping[tagName] = udtName;
+    }
+
+    // Return as BrowseResult
+    const variableInfos = [...variables.values()]
       .filter(v => isValidTagName(v.name))
       .map(v => {
         // Infer correct datatype from actual value (same failsafe as publishValue)
@@ -840,6 +911,14 @@ export async function createScanner(
           lastUpdated: v.lastUpdated,
         };
       });
+
+    log.eip.info(`Browse returning ${variableInfos.length} variables, ${Object.keys(udts).length} UDT definitions, ${Object.keys(structTagMapping).length} struct tag mappings`);
+
+    return {
+      variables: variableInfos,
+      udts,
+      structTags: structTagMapping,
+    };
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1071,7 +1150,8 @@ export async function createScanner(
             (async () => {
               try {
                 const results = await browseDevice(browseReq.deviceId, browseReq.host, browseReq.port, browseId);
-                publishBrowseProgress(browseId, "_all", "completed", results.length, results.length, 0, `Browse complete: ${results.length} total tags`);
+                const tagCount = results.variables.length;
+                publishBrowseProgress(browseId, "_all", "completed", tagCount, tagCount, 0, `Browse complete: ${tagCount} total tags`);
               } catch (err) {
                 log.eip.error(`Async browse failed: ${err}`);
                 publishBrowseProgress(browseId, browseReq.deviceId, "failed", 0, 0, 1, `Browse failed: ${err}`);
@@ -1082,11 +1162,11 @@ export async function createScanner(
 
           // Sync mode: wait for browse to complete and return results
           const results = await browseDevice(browseReq.deviceId, browseReq.host, browseReq.port, browseId);
-          log.eip.info(`Browse request: returning ${results.length} tags`);
+          log.eip.info(`Browse request: returning ${results.variables.length} tags, ${Object.keys(results.udts).length} UDTs`);
           msg.respond(new TextEncoder().encode(JSON.stringify(results)));
         } catch (err) {
           log.eip.error(`Error handling browse request: ${err}`);
-          msg.respond(new TextEncoder().encode("[]"));
+          msg.respond(new TextEncoder().encode(JSON.stringify({ variables: [], udts: {}, structTags: {} })));
         }
       }
     })();

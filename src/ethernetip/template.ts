@@ -56,6 +56,7 @@ const templateCache = new Map<number, Template>();
  * Map CIP type codes to data type names and sizes
  */
 const TYPE_INFO: Record<number, { name: string; size: number }> = {
+  // CIP elementary types
   0xc1: { name: "BOOL", size: 1 },
   0xc2: { name: "SINT", size: 1 },
   0xc3: { name: "INT", size: 2 },
@@ -67,11 +68,27 @@ const TYPE_INFO: Record<number, { name: string; size: number }> = {
   0xc9: { name: "ULINT", size: 8 },
   0xca: { name: "REAL", size: 4 },
   0xcb: { name: "LREAL", size: 8 },
-  0xd0: { name: "STRING", size: 88 }, // Default STRING size
+  0xcc: { name: "STIME", size: 4 },    // Synchronous time
+  0xcd: { name: "DATE", size: 2 },
+  0xce: { name: "TIME_OF_DAY", size: 4 },
+  0xcf: { name: "DATE_AND_TIME", size: 8 },
+  0xd0: { name: "STRING", size: 88 },   // Default STRING size
   0xd1: { name: "BYTE", size: 1 },
   0xd2: { name: "WORD", size: 2 },
   0xd3: { name: "DWORD", size: 4 },
   0xd4: { name: "LWORD", size: 8 },
+  0xd5: { name: "STRING2", size: 88 },
+  0xd6: { name: "FTIME", size: 4 },     // Fine time
+  0xd7: { name: "LTIME", size: 8 },     // Long time
+  0xd8: { name: "ITIME", size: 2 },     // Intermediate time
+  0xd9: { name: "STRINGN", size: 88 },
+  0xda: { name: "SHORT_STRING", size: 88 },
+  0xdb: { name: "TIME", size: 4 },
+  0xdc: { name: "EPATH", size: 4 },
+  0xdd: { name: "ENGUNIT", size: 4 },
+  0xde: { name: "STRINGI", size: 88 },
+  // Rockwell-specific types
+  0xa0: { name: "BIT_STRING", size: 4 },  // Rockwell BOOL arrays stored as 32-bit words
 };
 
 /**
@@ -468,11 +485,14 @@ function findStringDataStart(data: Uint8Array): number {
  * - Member names as null-terminated strings
  *
  * We scan for null-terminated strings that look like valid member names.
+ * IMPORTANT: We must parse ALL member names including hidden ones (ZZZZZ, __)
+ * because the string order must match the member definition order. If we stop
+ * early, later members get misaligned fallback names.
  */
 function parseTemplateStrings(
   data: Uint8Array,
   stringDataOffset: number,
-  memberCount: number,
+  _memberCount: number,
 ): { templateName: string; memberNames: string[] } {
   const stringData = data.subarray(stringDataOffset);
   const decoder = new TextDecoder();
@@ -500,14 +520,11 @@ function parseTemplateStrings(
 
   log.eip.debug(`parseTemplateStrings: template name "${templateName}", semicolon at ${semicolonPos}`);
 
-  // Scan for all null-terminated strings that look like valid member names
-  // Member names are typically:
-  // - 1-40 characters long
-  // - Start with letter or underscore
-  // - Contain only letters, digits, underscores
-  // - Are null-terminated
+  // Scan for ALL null-terminated strings — do NOT stop early.
+  // The string section contains names for ALL members including hidden ones
+  // (ZZZZZ*, __*). We must parse them all to maintain correct alignment
+  // between member definitions and member names.
   const memberNames: string[] = [];
-  const seenNames = new Set<string>();
 
   // Start scanning from just after the semicolon
   let searchStart = semicolonPos + 1;
@@ -520,29 +537,22 @@ function parseTemplateStrings(
         // Extract the string
         const str = decoder.decode(stringData.subarray(currentStart, i));
 
-        // Check if it looks like a valid member name
+        // Check if it looks like a valid member name (including hidden ZZZZZ/__ names)
         const isValidName =
           str.length >= 1 &&
-          str.length <= 50 &&
+          str.length <= 80 &&
           /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(str) &&
-          !str.includes(";") && // Not a template name
-          !seenNames.has(str); // Not a duplicate
+          !str.includes(";"); // Not a template name
 
         if (isValidName) {
           memberNames.push(str);
-          seenNames.add(str);
-
-          // Stop if we have enough names
-          if (memberNames.length >= memberCount) {
-            break;
-          }
         }
       }
       currentStart = i + 1;
     }
   }
 
-  log.eip.debug(`parseTemplateStrings: Found ${memberNames.length} unique member names (expected ${memberCount})`);
+  log.eip.debug(`parseTemplateStrings: Found ${memberNames.length} member names (including hidden)`);
 
   return { templateName, memberNames };
 }
@@ -568,14 +578,14 @@ export async function readTemplate(
   const { definitionSizeWords, instanceSizeBytes, memberCount } = attrs;
 
   // Calculate total definition size from attribute 4
-  // definitionSizeWords is in 32-bit words, so multiply by 4 for bytes
-  // Add extra bytes for member name strings - Rockwell templates often have
-  // member names that extend beyond the definitionSize
+  // Per Rockwell CIP spec, definitionSizeWords (attr 4) is the total size in
+  // 32-bit words of the ENTIRE template definition: member defs + type encoding + strings.
+  // However, some controllers underreport this size. To be safe, we add a generous
+  // margin for member name strings that may extend beyond the reported size.
   const baseDefinitionBytes = definitionSizeWords * 4;
-  // Estimate additional bytes needed for member name strings
-  // Average member name is ~15 chars + null terminator
-  const estimatedNameBytes = memberCount * 16;
-  const totalDefinitionBytes = baseDefinitionBytes + estimatedNameBytes;
+  // Add margin: estimate ~20 bytes per member for name strings as safety buffer
+  const safetyMargin = memberCount * 20;
+  const totalDefinitionBytes = baseDefinitionBytes + safetyMargin;
 
   log.eip.debug(`Template ${templateId}: sizeWords=${definitionSizeWords}, baseBytes=${baseDefinitionBytes}, estimatedTotal=${totalDefinitionBytes}, visibleMembers=${memberCount}`);
 
@@ -849,4 +859,11 @@ export function clearTemplateCache(): void {
  */
 export function getTemplateCacheSize(): number {
   return templateCache.size;
+}
+
+/**
+ * Get all cached templates (returns a copy)
+ */
+export function getCachedTemplates(): Map<number, Template> {
+  return new Map(templateCache);
 }
