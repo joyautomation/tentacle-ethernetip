@@ -96,7 +96,10 @@ async function main(): Promise<void> {
       moduleId: "ethernetip",
       lastSeen: Date.now(),
       startedAt,
-      metadata: {},
+      metadata: {
+        publishRate: scanner.getPublishRate().toFixed(1),
+        devices: JSON.stringify(scanner.getDeviceInfo()),
+      },
     };
     try {
       const encoder = new TextEncoder();

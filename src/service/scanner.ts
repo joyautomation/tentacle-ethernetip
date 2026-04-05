@@ -171,6 +171,10 @@ export type ScannerManager = {
   start: () => void;
   /** Stop all polling loops */
   stop: () => Promise<void>;
+  /** Get the current publish rate (metrics/second) over a sliding window */
+  getPublishRate: () => number;
+  /** Get device info for heartbeat metadata */
+  getDeviceInfo: () => { deviceId: string; host: string; port: number; tagCount: number }[];
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -194,6 +198,27 @@ export async function createScanner(
   // Per-device subscriber tracking: deviceId → (subscriberId → DeviceSubscription)
   const deviceSubscribers = new Map<string, Map<string, DeviceSubscription>>();
 
+  // Publish rate tracking (sliding window)
+  const publishTimestamps: number[] = [];
+  const RATE_WINDOW_MS = 10_000;
+
+  function recordPublish(count: number): void {
+    const now = Date.now();
+    for (let i = 0; i < count; i++) {
+      publishTimestamps.push(now);
+    }
+  }
+
+  function getPublishRate(): number {
+    const now = Date.now();
+    const cutoff = now - RATE_WINDOW_MS;
+    // Remove old timestamps
+    while (publishTimestamps.length > 0 && publishTimestamps[0] < cutoff) {
+      publishTimestamps.shift();
+    }
+    return publishTimestamps.length / (RATE_WINDOW_MS / 1000);
+  }
+
   // NATS subscriptions
   let variablesSub: Subscription | null = null;
   let browseSub: Subscription | null = null;
@@ -209,6 +234,10 @@ export async function createScanner(
   const unsubscribeSubject = `${MODULE_ID}.unsubscribe`;
   // Write command subject: ethernetip.command.>
   const writeCommandSubject = `${MODULE_ID}.command.>`;
+
+  /** Sanitize a device ID for use in NATS subjects (spaces and special chars are invalid). */
+  const sanitizeDeviceId = (id: string): string =>
+    id.replace(/[ .*>]/g, "_");
 
   /**
    * Sanitize variableId for use in NATS subject
@@ -585,7 +614,8 @@ export async function createScanner(
     const payload = new TextEncoder().encode(JSON.stringify(message));
 
     // Publish to per-variable subject: ethernetip.data.{deviceId}.{variableId}
-    nc.publish(`${dataSubject}.${conn.deviceId}.${sanitizeForSubject(variableId)}`, payload);
+    nc.publish(`${dataSubject}.${sanitizeDeviceId(conn.deviceId)}.${sanitizeForSubject(variableId)}`, payload);
+    recordPublish(1);
   }
 
   /**
@@ -641,7 +671,8 @@ export async function createScanner(
       timestamp: now,
       values: batchMessages,
     };
-    nc.publish(`${dataSubject}.${conn.deviceId}`, new TextEncoder().encode(JSON.stringify(batchPayload)));
+    nc.publish(`${dataSubject}.${sanitizeDeviceId(conn.deviceId)}`, new TextEncoder().encode(JSON.stringify(batchPayload)));
+    recordPublish(batchMessages.length);
 
     log.eip.debug(`Batch published ${batchMessages.length} values`);
   }
@@ -1546,6 +1577,17 @@ export async function createScanner(
       connections.clear();
       deviceSubscribers.clear();
       log.eip.info("Scanner stopped");
+    },
+
+    getPublishRate,
+
+    getDeviceInfo() {
+      return Array.from(connections.values()).map((conn) => ({
+        deviceId: conn.deviceId,
+        host: conn.host,
+        port: conn.port,
+        tagCount: conn.variables.size,
+      }));
     },
   };
 
